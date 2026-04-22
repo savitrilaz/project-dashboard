@@ -1,1922 +1,876 @@
-import hashlib
+"""
+RevOps Program Dashboard
+Read-only live feed from OneDrive Excel.
+Refreshes twice daily (cache TTL = 43200 seconds = 12 hours).
+Edit data directly in the Excel file — dashboard picks it up automatically.
+"""
 import re
+from collections import defaultdict
 from io import BytesIO
+from datetime import datetime
+import hashlib
 
-import numpy as np
 import pandas as pd
 import plotly.express as px
+import plotly.graph_objects as go
 import requests
 import streamlit as st
 
-# ─────────────────────────────────────────────
-ONEDRIVE_FILE_URL = "https://emerson-my.sharepoint.com/:x:/p/savitri_lazarus/IQB7_WEjDxxfQZDKz88rVLHpASyvoQKl8XH61HiTWzkGANQ?e=gAlAOv"
-# ─────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────
+ONEDRIVE_FILE_URL = (
+    "https://emerson-my.sharepoint.com/:x:/p/savitri_lazarus/"
+    "IQAQPOe1joHSTopYQHg4L61vAdgWzYvAdfVUHhZGNiI6TAM?e=YsNeJD"
+)
+REFRESH_TTL = 43200   # 12 hours = twice daily
+EDIT_LINK   = ONEDRIVE_FILE_URL  # click-through to edit in Excel
+# ─────────────────────────────────────────────────────────────
 
-C = {
-    "deep_blue": "#004B8D", "green": "#00573D", "navy": "#1B2552",
-    "bright_blue": "#1DB1DE", "soft_green": "#7CCF8B", "teal": "#00AD7C",
-    "light_blue": "#75D3EB", "gray": "#9FA1A4", "black": "#000000", "white": "#FFFFFF",
+# ── PALETTE ───────────────────────────────────────────────────
+C = dict(
+    navy="#1B2552", blue="#004B8D", teal="#00AD7C", lblue="#1DB1DE",
+    sgreen="#7CCF8B", lgreen="#75D3EB", green="#00573D", gray="#9FA1A4",
+    red="#C0392B", amber="#D97706", white="#FFFFFF", bg="#F4F6FA",
+)
+PALETTE = [C["blue"],C["lblue"],C["teal"],C["sgreen"],C["navy"],C["lgreen"],C["green"],C["gray"]]
+STATUS_COLOR = {
+    "Delayed":     C["red"],
+    "At Risk":     C["amber"],
+    "On Track":    C["teal"],
+    "Active":      C["blue"],
+    "In Progress": C["lblue"],
+    "Complete":    C["sgreen"],
+    "Completed":   C["sgreen"],
+    "Not Started": C["gray"],
+    "Planning":    C["lgreen"],
 }
-PALETTE = [C["deep_blue"], C["bright_blue"], C["teal"], C["soft_green"],
-           C["navy"], C["light_blue"], C["green"], C["gray"]]
-STATUS_COLORS = {
-    "Delayed": "#C0392B", "At Risk": "#E67E22", "On Track": C["teal"],
-    "Active": C["deep_blue"], "In Progress": C["bright_blue"],
-    "Complete": C["soft_green"], "Completed": C["soft_green"],
-    "Not Started": C["gray"], "Planning": C["light_blue"],
+BAND_COLOR = {
+    "Top Priority":    C["teal"],
+    "Middle Priority": C["blue"],
+    "Lower Priority":  C["lblue"],
+    "N/A":             C["gray"],
 }
 
-FUTURE_FIELDS = [
-    ("Business Value",      ["Business Value","BusinessValue","Strategic Value"],
-     "Compares strategic upside across projects to prioritise high-return work."),
-    ("Financial Value",     ["Financial Value","FinancialValue","Fin Value"],
-     "Quantifies revenue or cost-savings potential per project."),
-    ("Dollars at Risk",     ["Dollars at Risk","DollarsAtRisk","$ at Risk","Risk Dollars"],
-     "Estimates loss exposure if a project is delayed or cancelled."),
-    ("Estimated Capacity",  ["Estimated Capacity","Capacity","FTE Capacity","Estimated FTE"],
-     "Identifies where teams are overcommitted and where buffer exists."),
-    ("Hard Deadline",       ["Hard Deadline","HardDeadline","Deadline Date","Due Date"],
-     "Distinguishes movable work from immovable commitments."),
-    ("Deadline Type",       ["Deadline Type","DeadlineType","Deadline Category"],
-     "Classifies deadlines as regulatory, contractual, internal, or aspirational."),
-    ("Dependency Criticality",["Dependency Criticality","DependencyCriticality","Criticality"],
-     "Identifies projects that unblock downstream work."),
-    ("Executive Sponsor",   ["Executive Sponsor","ExecSponsor","Sponsor","Executive Owner"],
-     "Clarifies decision ownership and escalation path."),
-    ("Confidence Level",    ["Confidence Level","Confidence","ConfidenceLevel"],
-     "Flags uncertain projects that may need review or re-scoping."),
-    ("Blocker Reason",      ["Blocker Reason","BlockerReason","Blocker","Block Reason"],
-     "Separates delay caused by capacity, data, or dependency issues."),
-]
-
-st.set_page_config(page_title="RevOps Program Dashboard", layout="wide",
-                   initial_sidebar_state="expanded")
+# ── PAGE CONFIG ───────────────────────────────────────────────
+st.set_page_config(
+    page_title="RevOps Program Dashboard",
+    layout="wide",
+    initial_sidebar_state="collapsed",
+)
 
 st.markdown(f"""
 <style>
-@import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap');
-html,body,[class*="css"]{{font-family:'Inter',sans-serif;}}
-.main{{background-color:#F7F8FA;}}
-.block-container{{padding:1.6rem 2.2rem 2rem 2.2rem;max-width:1440px;}}
-.kpi-wrap{{background:{C["white"]};border-radius:12px;padding:18px 20px 14px 20px;
-  border:1px solid #E8ECF0;box-shadow:0 2px 8px rgba(0,0,0,0.05);
-  min-height:108px;display:flex;flex-direction:column;justify-content:space-between;}}
-.kpi-wrap.ph{{opacity:0.5;}}
-.kpi-label{{font-size:10px;font-weight:700;letter-spacing:0.07em;text-transform:uppercase;
-  color:{C["gray"]};margin-bottom:2px;}}
-.kpi-value{{font-size:32px;font-weight:700;color:{C["navy"]};line-height:1;}}
-.kpi-value.danger{{color:#C0392B;}} .kpi-value.success{{color:{C["teal"]};}}
-.kpi-value.warn{{color:#D97706;}} .kpi-value.ph{{color:{C["gray"]};font-size:13px;font-weight:400;margin-top:6px;}}
-.kpi-sub{{font-size:10px;color:{C["gray"]};margin-top:4px;}}
-.kpi-accent-bar{{height:3px;border-radius:2px;margin-bottom:8px;}}
-.section-title{{font-size:12px;font-weight:700;letter-spacing:0.09em;text-transform:uppercase;
-  color:{C["navy"]};margin-bottom:14px;padding-bottom:7px;
-  border-bottom:2px solid {C["deep_blue"]};display:inline-block;}}
-.section-divider{{border:none;border-top:1px solid #E8ECF0;margin:28px 0 24px 0;}}
-.exec-header{{background:linear-gradient(135deg,{C["navy"]} 0%,{C["deep_blue"]} 100%);
-  border-radius:12px;padding:22px 28px;color:white;margin-bottom:24px;}}
-.exec-header h1{{font-size:21px;font-weight:700;color:white!important;margin:0 0 3px 0;}}
-.exec-header .subtitle{{font-size:13px;color:rgba(255,255,255,0.6);margin-bottom:12px;}}
-.exec-header .dynamic{{font-size:13px;color:rgba(255,255,255,0.88);
-  border-top:1px solid rgba(255,255,255,0.15);padding-top:11px;margin-top:2px;}}
-.risk-item{{background:#FEF3F2;border-left:3px solid #C0392B;border-radius:0 6px 6px 0;
-  padding:9px 13px;margin-bottom:7px;font-size:12px;color:#1a1a1a;}}
-.risk-item.warn{{background:#FFF8F0;border-left-color:#E67E22;}}
-.risk-item.info{{background:#F0F7FF;border-left-color:{C["deep_blue"]};}}
-.risk-item.ok{{background:#F0FFF8;border-left-color:{C["teal"]};}}
-.risk-item.muted{{background:#F9FAFB;border-left-color:{C["gray"]};color:{C["gray"]};}}
-.detail-card{{background:{C["white"]};border-radius:10px;padding:16px 18px;
-  border:1px solid #E8ECF0;margin-bottom:10px;}}
-.detail-label{{font-size:10px;font-weight:700;letter-spacing:0.05em;text-transform:uppercase;
-  color:{C["gray"]};margin-bottom:2px;}}
-.detail-value{{font-size:13px;font-weight:500;color:{C["navy"]};}}
-.detail-value.ph{{color:{C["gray"]};font-style:italic;font-weight:400;}}
-.status-badge{{display:inline-block;padding:2px 9px;border-radius:20px;
-  font-size:10px;font-weight:700;letter-spacing:0.04em;}}
-.empty-state{{text-align:center;padding:40px 24px;color:{C["gray"]};font-size:13px;}}
-.edit-banner{{background:#FEF3C7;border:1px solid #F59E0B;border-radius:8px;
-  padding:10px 16px;font-size:12px;color:#92400E;margin-bottom:14px;}}
-.insight-box{{background:{C["white"]};border-radius:10px;padding:16px 18px;
-  border:1px solid #E8ECF0;margin-bottom:12px;}}
-.ff-card{{background:{C["white"]};border-radius:10px;padding:13px 16px;
-  border:1px solid #E8ECF0;margin-bottom:8px;display:flex;
-  align-items:flex-start;gap:14px;}}
-.ff-name{{font-size:12px;font-weight:700;color:{C["navy"]};min-width:170px;}}
-.ff-why{{font-size:12px;color:#374151;flex:1;line-height:1.5;}}
-.ff-badge-yes{{font-size:10px;font-weight:700;background:#D1FAE5;color:#065F46;
-  padding:2px 8px;border-radius:10px;white-space:nowrap;}}
-.ff-badge-no{{font-size:10px;font-weight:700;background:#F3F4F6;color:{C["gray"]};
-  padding:2px 8px;border-radius:10px;white-space:nowrap;}}
-.ph-note{{background:#F9FAFB;border:1px dashed #D1D5DB;border-radius:8px;
-  padding:10px 14px;font-size:11px;color:{C["gray"]};margin:6px 0 10px 0;}}
-[data-testid="stSidebar"]{{background:{C["white"]};border-right:1px solid #E8ECF0;}}
+@import url('https://fonts.googleapis.com/css2?family=DM+Sans:wght@300;400;500;600;700&family=DM+Mono:wght@400;500&display=swap');
+html,body,[class*="css"]{{font-family:'DM Sans',sans-serif;background:{C['bg']};}}
+.main{{background:{C['bg']};}}
+.block-container{{padding:1.2rem 1.8rem 2rem;max-width:1520px;}}
+
+/* ── KPI cards ── */
+.kpi{{background:{C['white']};border-radius:10px;padding:16px 18px 12px;
+  border:1px solid #E2E8F2;box-shadow:0 1px 6px rgba(0,0,0,0.05);}}
+.kpi-val{{font-size:30px;font-weight:700;line-height:1;margin:6px 0 4px;}}
+.kpi-lbl{{font-size:10px;font-weight:700;letter-spacing:.07em;text-transform:uppercase;color:{C['gray']};}}
+.kpi-sub{{font-size:10px;color:{C['gray']};margin-top:3px;}}
+.kpi-bar{{height:3px;border-radius:2px;margin-bottom:8px;}}
+
+/* ── Section title ── */
+.sec{{font-size:11px;font-weight:700;letter-spacing:.09em;text-transform:uppercase;
+  color:{C['navy']};border-bottom:2px solid {C['blue']};padding-bottom:5px;
+  display:inline-block;margin-bottom:12px;}}
+
+/* ── Status badge ── */
+.badge{{display:inline-block;padding:2px 8px;border-radius:12px;
+  font-size:10px;font-weight:700;letter-spacing:.03em;}}
+
+/* ── Project row card ── */
+.prow{{background:{C['white']};border-radius:8px;padding:12px 16px;
+  border:1px solid #E2E8F2;margin-bottom:7px;cursor:pointer;
+  transition:box-shadow .15s;}}
+.prow:hover{{box-shadow:0 3px 12px rgba(0,0,0,0.1);}}
+.prow-id{{font-family:'DM Mono',monospace;font-size:10px;color:{C['gray']};}}
+.prow-name{{font-size:13px;font-weight:600;color:{C['navy']};}}
+.prow-desc{{font-size:11px;color:#555;margin-top:2px;line-height:1.4;}}
+
+/* ── Detail panel ── */
+.detail-hdr{{background:linear-gradient(135deg,{C['navy']} 0%,{C['blue']} 100%);
+  border-radius:10px;padding:18px 22px;color:white;margin-bottom:14px;}}
+.detail-field{{margin-bottom:10px;}}
+.detail-lbl{{font-size:10px;font-weight:700;letter-spacing:.06em;text-transform:uppercase;
+  color:{C['gray']};margin-bottom:2px;}}
+.detail-val{{font-size:13px;font-weight:500;color:{C['navy']};}}
+.detail-val.ph{{color:{C['gray']};font-style:italic;font-weight:400;}}
+
+/* ── Edit callout ── */
+.edit-cta{{background:#EFF6FF;border:1px solid {C['lblue']};border-radius:8px;
+  padding:12px 16px;font-size:12px;color:{C['navy']};margin:12px 0;}}
+
+/* ── Divider ── */
+hr.slim{{border:none;border-top:1px solid #E2E8F2;margin:20px 0;}}
+
+/* ── Tab styling ── */
+.stTabs [data-baseweb="tab-list"]{{gap:4px;background:#EAEEF4;border-radius:8px;padding:4px;}}
+.stTabs [data-baseweb="tab"]{{border-radius:6px;font-size:12px;font-weight:500;padding:5px 14px;}}
+.stTabs [aria-selected="true"]{{background:{C['white']};color:{C['navy']};}}
+
+/* ── Expander ── */
+.streamlit-expanderHeader{{font-size:12px;font-weight:600;}}
+
+/* ── Refresh banner ── */
+.refresh-note{{font-size:10px;color:{C['gray']};text-align:right;
+  padding:4px 0 0;letter-spacing:.03em;}}
+
+/* Hide default streamlit chrome */
 #MainMenu{{visibility:hidden;}}footer{{visibility:hidden;}}header{{visibility:hidden;}}
-.stTabs [data-baseweb="tab-list"]{{gap:4px;background:#F0F2F5;border-radius:8px;padding:4px;}}
-.stTabs [data-baseweb="tab"]{{border-radius:6px;padding:5px 14px;font-size:12px;font-weight:500;}}
-.stTabs [aria-selected="true"]{{background:{C["white"]};color:{C["navy"]};}}
 </style>
 """, unsafe_allow_html=True)
 
-# ─── HELPERS ──────────────────────────────────
-def normalize_cols(df):
-    df.columns = [c.strip() for c in df.columns]
-    return df
-
-def get_col(df, *candidates):
+# ── HELPERS ───────────────────────────────────────────────────
+def nc(df, *candidates):
+    """Find first matching column name, including fuzzy."""
     for c in candidates:
-        if c in df.columns:
-            return c
+        if c in df.columns: return c
     for c in candidates:
         for col in df.columns:
             if c.lower().replace(" ","").replace("?","") in col.lower().replace(" ","").replace("?",""):
                 return col
     return None
 
-def build_download_url(url):
+def build_dl_url(url):
     if "/:x:/p/" in url or "/:x:/s/" in url:
         return url + ("&" if "?" in url else "?") + "download=1"
     if "_layouts/15/Doc.aspx" in url:
-        m = re.search(r'sourcedoc=%7B([^%]+)%7D', url, re.IGNORECASE)
+        m = re.search(r'sourcedoc=%7B([^%]+)%7D', url, re.I)
         if m:
             base = url.split("/_layouts/")[0]
             return f"{base}/_layouts/15/download.aspx?UniqueId={m.group(1)}"
-    if "1drv.ms" in url:
-        try:
-            r = requests.get(url, allow_redirects=True, timeout=15)
-            return r.url + ("&" if "?" in r.url else "?") + "download=1"
-        except Exception:
-            pass
     return url + ("&" if "?" in url else "?") + "download=1"
 
-def chart_layout(fig, height=300, legend=False):
+def normalize_cdm(v):
+    if pd.isna(v) or str(v).strip() == "": return "Unknown"
+    s = str(v).strip().upper()
+    if s in ("Y","YES","TRUE","1"): return "Yes"
+    if s in ("N","NO","FALSE","0"): return "No"
+    return "Unknown"
+
+def status_badge(s, size=10):
+    cm = {
+        "delayed":     ("#FEE2E2","#C0392B"),
+        "at risk":     ("#FEF3C7","#D97706"),
+        "on track":    ("#D1FAE5","#065F46"),
+        "active":      ("#DBEAFE","#1E40AF"),
+        "in progress": ("#E0F2FE","#0369A1"),
+        "complete":    ("#D1FAE5","#065F46"),
+        "completed":   ("#D1FAE5","#065F46"),
+        "not started": ("#F3F4F6","#374151"),
+        "planning":    ("#EDE9FE","#5B21B6"),
+    }
+    bg, fg = cm.get(str(s).lower(), ("#F3F4F6","#374151"))
+    return f"<span class='badge' style='background:{bg};color:{fg};font-size:{size}px'>{s}</span>"
+
+def cdm_badge(v):
+    if v == "Yes":
+        return "<span class='badge' style='background:#FEF3C7;color:#D97706'>⚠ CDM</span>"
+    return "<span style='color:#9FA1A4;font-size:10px'>—</span>"
+
+def fmt_val(v, prefix="$"):
+    try:
+        n = float(v)
+        if n >= 1_000_000: return f"{prefix}{n/1_000_000:.1f}M"
+        if n >= 1_000:     return f"{prefix}{n/1_000:.0f}K"
+        return f"{prefix}{n:.0f}"
+    except Exception:
+        return str(v) if v else "—"
+
+def chart_base(fig, height=260):
     fig.update_layout(
-        height=height, margin=dict(t=14,b=14,l=8,r=8),
+        height=height, margin=dict(t=12,b=12,l=8,r=8),
         plot_bgcolor="white", paper_bgcolor="white",
-        font=dict(family="Inter, sans-serif", size=11, color="#374151"),
-        showlegend=legend,
-        legend=dict(orientation="h",yanchor="bottom",y=1.02,
-                    xanchor="right",x=1,font=dict(size=10)) if legend else {},
-        xaxis=dict(gridcolor="#F0F2F5",linecolor="#E8ECF0",tickfont=dict(size=10)),
-        yaxis=dict(gridcolor="#F0F2F5",linecolor="#E8ECF0",tickfont=dict(size=10)),
+        font=dict(family="DM Sans", size=11, color="#374151"),
+        showlegend=False,
+        xaxis=dict(gridcolor="#F0F4F8",linecolor="#E2E8F2",tickfont=dict(size=10)),
+        yaxis=dict(gridcolor="#F0F4F8",linecolor="#E2E8F2",tickfont=dict(size=10)),
     )
     fig.update_traces(marker_line_width=0)
     return fig
 
-def status_badge_html(s):
-    cm = {
-        "delayed":("#FEE2E2","#C0392B"),"at risk":("#FEF3C7","#D97706"),
-        "on track":("#D1FAE5","#065F46"),"active":("#DBEAFE","#1E40AF"),
-        "in progress":("#E0F2FE","#0369A1"),"complete":("#D1FAE5","#065F46"),
-        "completed":("#D1FAE5","#065F46"),"not started":("#F3F4F6","#374151"),
-        "planning":("#EDE9FE","#5B21B6"),
-    }
-    bg,fg = cm.get(str(s).lower(),("#F3F4F6","#374151"))
-    return f"<span class='status-badge' style='background:{bg};color:{fg};'>{s}</span>"
-
-def normalize_cdm(val):
-    if pd.isna(val) or str(val).strip()=="": return "Unknown"
-    v = str(val).strip().lower()
-    if v in ("yes","y","true","1"): return "Yes"
-    if v in ("no","n","false","0"): return "No"
-    return "Unknown"
-
-def det_jitter(series, scale=0.15):
-    def _j(v):
-        h = int(hashlib.md5(str(v).encode()).hexdigest(),16)
-        return ((h%1000)/1000.0-0.5)*2*scale
-    return series.apply(_j)
-
-def kpi_card(col, label, value, sub, color_class="", accent=None, is_ph=False):
-    a = accent or C["deep_blue"]
-    ph = " ph" if is_ph else ""
-    col.markdown(f"""
-    <div class="kpi-wrap{ph}">
-      <div>
-        <div class="kpi-accent-bar" style="background:{a};width:28px;"></div>
-        <div class="kpi-label">{label}</div>
-        <div class="kpi-value {color_class}">{value}</div>
-      </div>
-      <div class="kpi-sub">{sub}</div>
-    </div>""", unsafe_allow_html=True)
-
-def resolve_future(df, candidates):
-    for c in candidates:
-        f = get_col(df, c)
-        if f: return f
-    return None
-
-def fval(row, col, fallback="Not yet captured"):
-    if col is None: return fallback
-    v = row.get(col)
-    if v is None: return fallback
+# ── DATA LOAD (cached 12 hours) ───────────────────────────────
+@st.cache_data(ttl=REFRESH_TTL, show_spinner=False)
+def load_all(url):
     try:
-        if pd.isna(v): return fallback
-    except Exception:
-        pass
-    return str(v).strip() or fallback
-
-# ─── DATA LOAD ─────────────────────────────────
-@st.cache_data(ttl=60)
-def load_data(url):
-    try:
-        dl = build_download_url(url)
-        hdr = {"User-Agent":"Mozilla/5.0"}
-        r = requests.get(dl, headers=hdr, timeout=30, allow_redirects=True)
+        dl = build_dl_url(url)
+        r = requests.get(dl, headers={"User-Agent":"Mozilla/5.0"}, timeout=30, allow_redirects=True)
         r.raise_for_status()
         if "html" in r.headers.get("Content-Type","").lower():
-            fb = url+("&download=1" if "?" in url else "?download=1")
-            r = requests.get(fb, headers=hdr, timeout=30, allow_redirects=True)
+            fb = url + ("&download=1" if "?" in url else "?download=1")
+            r = requests.get(fb, headers={"User-Agent":"Mozilla/5.0"}, timeout=30, allow_redirects=True)
             r.raise_for_status()
-        content = BytesIO(r.content)
+        buf = BytesIO(r.content)
         sheets = {}
         for s in ["Projects","Project_Resources","Dependencies","Project_Value_Map","Value_Category_Dictionary"]:
             try:
-                df = pd.read_excel(content, sheet_name=s, engine="openpyxl")
-                sheets[s] = normalize_cols(df)
+                df = pd.read_excel(buf, sheet_name=s, engine="openpyxl")
+                df.columns = [c.strip() for c in df.columns]
+                sheets[s] = df
             except Exception:
                 sheets[s] = None
-        return sheets, None
+        return sheets, None, datetime.now()
     except Exception as e:
-        return None, str(e)
+        return None, str(e), datetime.now()
 
-with st.spinner(""):
-    sheets, err = load_data(ONEDRIVE_FILE_URL)
+# ── LOAD ──────────────────────────────────────────────────────
+with st.spinner("Loading portfolio data…"):
+    sheets, err, loaded_at = load_all(ONEDRIVE_FILE_URL)
 
 if err:
-    st.error(f"**Data load failed:** {err}")
-    st.info("Ensure the SharePoint link allows 'Anyone with the link' to view.")
+    st.error(f"Could not load data: {err}")
+    st.info("Check that the SharePoint link is set to 'Anyone with the link can view'.")
     st.stop()
 
-proj_df  = sheets.get("Projects")
-res_df   = sheets.get("Project_Resources")
-dep_df   = sheets.get("Dependencies")
-val_map_df  = sheets.get("Project_Value_Map")   # normalized many-to-one
-val_dict_df = sheets.get("Value_Category_Dictionary")  # reference
-
-for m in [s for s,d in sheets.items() if d is None]:
-    st.warning(f"Sheet '{m}' could not be loaded.")
+proj_df = sheets["Projects"]
+res_df  = sheets["Project_Resources"]
+dep_df  = sheets["Dependencies"]
+vm_df   = sheets["Project_Value_Map"]
+vd_df   = sheets["Value_Category_Dictionary"]
 
 if proj_df is None:
-    st.error("Projects sheet is required.")
-    st.stop()
+    st.error("Projects sheet missing."); st.stop()
 
-# ─── COLUMN MAP ────────────────────────────────
-owner_col          = get_col(proj_df,"Owner","owner","PM","Project Owner")
-team_col_p         = get_col(proj_df,"Team","team","Department")
-status_col         = get_col(proj_df,"Status","status","Project Status")
-cycle_col          = get_col(proj_df,"Cycle","cycle","Sprint","Quarter")
-priority_col       = get_col(proj_df,"Priority","priority","Priority Type")
-effort_col         = get_col(proj_df,"Effort","effort","Effort Score")
-impact_col         = get_col(proj_df,"Impact","impact","Impact Score")
-proj_id_col        = get_col(proj_df,"Project ID","ProjectID","ID","project_id")
-proj_name_col      = get_col(proj_df,"Project","Project Name","project","Name")
-delayed_impact_col = get_col(proj_df,"If Delayed Impact","Delayed Impact","delay_impact","Impact If Delayed")
-notes_col          = get_col(proj_df,"Notes","notes","Risk Notes","Delay Notes","Comments")
-cdm_col_raw        = get_col(proj_df,"Dependent on CDM Project?","Dependent on CDM Project",
-                              "CDM Dependency","CDM Project","CDM","DependentonCDMProject")
+# ── COLUMN MAP ────────────────────────────────────────────────
+pid_c    = nc(proj_df,"Project ID","ProjectID","ID")
+name_c   = nc(proj_df,"Project","Project Name","Name")
+rank_c   = nc(proj_df,"Priority Rank","PriorityRank","Rank")
+type_c   = nc(proj_df,"Priority Type","ProjectType","Type")
+strat_c  = nc(proj_df,"Strategic Priority","FLMC Tag","Strategic")
+owner_c  = nc(proj_df,"Owner","owner")
+core_c   = nc(proj_df,"Core Team","CoreTeam","Requested By")
+status_c = nc(proj_df,"Status","status")
+cycle_c  = nc(proj_df,"Cycle","cycle")
+effort_c = nc(proj_df,"Effort","effort")
+impact_c = nc(proj_df,"Impact","impact")
+invest_c = nc(proj_df,"Investment","investment")
+delay_c  = nc(proj_df,"Delayed Flag","Delayed","delay_flag")
+deli_c   = nc(proj_df,"If Delayed Impact","Delayed Impact")
+band_c   = nc(proj_df,"Priority Band","Band")
+cdm_c    = nc(proj_df,"CDM Dependency Flag","CDM Dependency","CDM")
+bizprog_c= nc(proj_df,"Business Program","BizProg")
+bv_c     = nc(proj_df,"Business Value ($)","Business Value","BizValue")
+dar_c    = nc(proj_df,"Dollars at Risk ($)","Dollars at Risk","DAR")
+rawval_c = nc(proj_df,"Raw Value Description","RawValue")
+valgrp_c = nc(proj_df,"Value Groups","ValueGroups")
+valcat_c = nc(proj_df,"Value Categories","ValueCategories")
 
-CDM_COL = "__cdm__"
-proj_df[CDM_COL] = proj_df[cdm_col_raw].apply(normalize_cdm) if cdm_col_raw else "Unknown"
+# Resources
+res_pid_c  = nc(res_df,"Project ID","ProjectID","ID") if res_df is not None else None
+res_team_c = nc(res_df,"Team","team") if res_df is not None else None
 
-# Resolve future fields
-fc = {}  # future cols map: display_name -> actual col or None
-for fname, cands, _ in FUTURE_FIELDS:
-    fc[fname] = resolve_future(proj_df, cands)
+# Dependencies
+dep_pid_c = nc(dep_df,"Project ID","ProjectID","ID") if dep_df is not None else None
+dep_on_c  = nc(dep_df,"Depends On Project ID","DependsOn","dependency") if dep_df is not None else None
 
-team_col_r = None
-pid_col_r  = None
-if res_df is not None:
-    team_col_r = get_col(res_df,"Team","team","Department","Resource Team")
-    pid_col_r  = get_col(res_df,"Project ID","ProjectID","ID")
+# Normalise CDM
+CDM = "__cdm__"
+proj_df[CDM] = proj_df[cdm_c].apply(normalize_cdm) if cdm_c else "Unknown"
 
-# ─── NEW SHEET COLUMN MAP ─────────────────────────
-# Project_Value_Map columns
-vm_pid_col   = get_col(val_map_df, "Project ID","ProjectID","ID") if val_map_df is not None else None
-vm_cat_col   = get_col(val_map_df, "Value Category","ValueCategory","Category","value_category") if val_map_df is not None else None
-vm_grp_col   = get_col(val_map_df, "Value Group","ValueGroup","Group","value_group") if val_map_df is not None else None
+# Resource lookup
+proj_teams = defaultdict(list)
+if res_df is not None and res_pid_c and res_team_c:
+    for _, row in res_df.iterrows():
+        if pd.notna(row[res_pid_c]) and pd.notna(row[res_team_c]):
+            proj_teams[str(row[res_pid_c])].append(str(row[res_team_c]))
 
-# Value_Category_Dictionary columns
-vd_cat_col   = get_col(val_dict_df, "Value Category","Category") if val_dict_df is not None else None
-vd_grp_col   = get_col(val_dict_df, "Value Group","Group") if val_dict_df is not None else None
-vd_desc_col  = get_col(val_dict_df, "Description","Desc","definition") if val_dict_df is not None else None
+# Dependency lookup
+proj_deps = defaultdict(list)
+if dep_df is not None and dep_pid_c and dep_on_c:
+    for _, row in dep_df.iterrows():
+        if pd.notna(row[dep_pid_c]) and pd.notna(row[dep_on_c]):
+            raw = str(row[dep_on_c])
+            deps = [d.strip() for d in raw.replace(";",",").split(",") if d.strip()]
+            proj_deps[str(row[dep_pid_c])].extend(deps)
 
-# Project-level new fields (may or may not exist)
-proj_type_col    = get_col(proj_df, "Project Type","ProjectType","Type","project_type")
-priority_rank_col= get_col(proj_df, "Priority Rank","PriorityRank","Rank","rank")
-biz_val_col      = get_col(proj_df, "Business Value","BusinessValue","business_value")
-dar_proj_col     = get_col(proj_df, "Dollars at Risk","DollarsAtRisk","$ at Risk")
-func_col         = get_col(proj_df, "Function","function","Functional Area","func")
+# ── FILTER TO REVOPS ──────────────────────────────────────────
+revops_df = proj_df[proj_df[owner_c].str.strip() == "RevOps"].copy() if owner_c else proj_df.copy()
 
-# Priority Band helper
-def assign_priority_band(df, rank_col):
-    """Assign Top / Middle / Lower based on Priority Rank if present."""
-    if rank_col is None or rank_col not in df.columns:
-        return pd.Series(["Unranked"]*len(df), index=df.index)
-    ranks = pd.to_numeric(df[rank_col], errors="coerce")
-    n = ranks.notna().sum()
-    if n == 0:
-        return pd.Series(["Unranked"]*len(df), index=df.index)
-    top_cut    = ranks.quantile(0.33)
-    mid_cut    = ranks.quantile(0.67)
-    def _band(r):
-        if pd.isna(r): return "Unranked"
-        if r <= top_cut: return "Top"
-        if r <= mid_cut: return "Middle"
-        return "Lower"
-    return ranks.apply(_band)
+# ── SHARED METRICS ────────────────────────────────────────────
+total      = len(revops_df)
+delayed_m  = revops_df[delay_c].str.strip().str.upper() == "Y" if delay_c else pd.Series([False]*total, index=revops_df.index)
+delayed_n  = int(delayed_m.sum())
+strategic_n= int((revops_df[type_c].str.strip() == "Strategic").sum()) if type_c else 0
+sustaining_n=int((revops_df[type_c].str.strip() == "Sustaining").sum()) if type_c else 0
+cdm_yes_n  = int((revops_df[CDM] == "Yes").sum())
+flmc_n     = int(revops_df[strat_c].str.contains("FLMC",na=False).sum()) if strat_c else 0
 
-proj_df["__band__"] = assign_priority_band(proj_df, priority_rank_col)
+top_total  = int((revops_df[band_c] == "Top Priority").sum()) if band_c else 0
+top_delayed= int(((revops_df[band_c] == "Top Priority") & delayed_m).sum()) if band_c else 0
+top_ok     = top_total - top_delayed
+strat_del  = int(((revops_df[type_c] == "Strategic") & delayed_m).sum()) if type_c else 0
 
-# ─── SESSION STATE ─────────────────────────────
-for k,v in [("view","Executive Summary"),("edit_mode",False),("edits",{}),
-             ("proj_edits",None),("vm_edits",None),("res_edits",None),("dep_edits",None),
-             ("active_tab","Project Configuration")]:
-    if k not in st.session_state:
-        st.session_state[k] = v
+bv_total   = None
+dar_total  = None
+if bv_c:
+    v = pd.to_numeric(revops_df[bv_c], errors="coerce")
+    if v.notna().any(): bv_total = v.sum()
+if dar_c:
+    v = pd.to_numeric(revops_df[dar_c], errors="coerce")
+    if v.notna().any(): dar_total = v.sum()
 
-# Initialise editable copies in session state once
-if st.session_state["proj_edits"] is None:
-    st.session_state["proj_edits"] = proj_df.copy()
-if val_map_df is not None and st.session_state["vm_edits"] is None:
-    st.session_state["vm_edits"] = val_map_df.copy()
-if res_df is not None and st.session_state["res_edits"] is None:
-    st.session_state["res_edits"] = res_df.copy()
-if dep_df is not None and st.session_state["dep_edits"] is None:
-    st.session_state["dep_edits"] = dep_df.copy()
-
-# ─── SIDEBAR ───────────────────────────────────
-with st.sidebar:
+# ── MANUAL REFRESH ────────────────────────────────────────────
+col_hdr, col_refresh = st.columns([8,1])
+with col_hdr:
     st.markdown(f"""
-    <div style='margin-bottom:18px;'>
-      <div style='font-size:14px;font-weight:700;color:{C["navy"]};'>RevOps Dashboard</div>
-      <div style='font-size:10px;color:{C["gray"]};margin-top:2px;letter-spacing:0.05em;'>FILTER CONTROLS</div>
-    </div>""", unsafe_allow_html=True)
+    <div style='display:flex;align-items:baseline;gap:12px;margin-bottom:4px;'>
+      <span style='font-size:20px;font-weight:700;color:{C['navy']};'>RevOps Program Dashboard</span>
+      <span style='font-size:12px;color:{C['gray']};'>FY26 · Owner = RevOps · Read-only live view</span>
+    </div>
+    """, unsafe_allow_html=True)
+with col_refresh:
+    if st.button("↺ Refresh", help="Force reload from OneDrive (auto-refreshes every 12 hours)"):
+        st.cache_data.clear()
+        st.rerun()
 
-    base = proj_df.copy()
-    sel_owners = []
+st.markdown(f"<div class='refresh-note'>Last loaded: {loaded_at.strftime('%B %d, %Y at %I:%M %p')} · "
+            f"Next auto-refresh in ~{max(0,12 - int((datetime.now()-loaded_at).seconds/3600))} hr · "
+            f"<a href='{EDIT_LINK}' target='_blank' style='color:{C['blue']};text-decoration:none;font-weight:600;'>"
+            f"✏️ Edit in Excel →</a></div>", unsafe_allow_html=True)
 
-    if owner_col:
-        owners = sorted(base[owner_col].dropna().unique().tolist())
-        default_owners = ["RevOps"] if "RevOps" in owners else owners
-        sel_owners = st.multiselect("Owner", owners, default=default_owners)
-        if sel_owners:
-            base = base[base[owner_col].isin(sel_owners)]
+st.markdown("<hr class='slim'>", unsafe_allow_html=True)
 
-    if team_col_p:
-        sel_teams_sb = st.multiselect("Team", sorted(proj_df[team_col_p].dropna().unique().tolist()), default=[])
-        if sel_teams_sb:
-            base = base[base[team_col_p].isin(sel_teams_sb)]
+# ═══════════════════════════════════════════════════════════════
+# VIEW TOGGLE
+# ═══════════════════════════════════════════════════════════════
+view_col, _ = st.columns([3,5])
+with view_col:
+    view = st.radio("", ["📋 Executive Summary","📊 Portfolio Detail","🔍 Project Explorer"],
+                    horizontal=True, label_visibility="collapsed",
+                    key="main_view")
 
-    if status_col:
-        sel_status_sb = st.multiselect("Status", sorted(proj_df[status_col].dropna().unique().tolist()), default=[])
-        if sel_status_sb:
-            base = base[base[status_col].isin(sel_status_sb)]
+st.markdown("<hr class='slim'>", unsafe_allow_html=True)
 
-    if cycle_col:
-        sel_cycles_sb = st.multiselect("Cycle", sorted(proj_df[cycle_col].dropna().unique().tolist()), default=[])
-        if sel_cycles_sb:
-            base = base[base[cycle_col].isin(sel_cycles_sb)]
+# ═══════════════════════════════════════════════════════════════
+# ██  EXECUTIVE SUMMARY  ██
+# ═══════════════════════════════════════════════════════════════
+if view == "📋 Executive Summary":
 
-    if priority_col:
-        sel_pris_sb = st.multiselect("Priority Type", sorted(proj_df[priority_col].dropna().unique().tolist()), default=[])
-        if sel_pris_sb:
-            base = base[base[priority_col].isin(sel_pris_sb)]
+    # ── KPI Row 1 ─────────────────────────────────────────────
+    k = st.columns(6)
+    kpi_data = [
+        ("Total Projects",   str(total),          "Owner = RevOps",            C["navy"],    ""),
+        ("Strategic",        str(strategic_n),    "Project type: Strategic",   C["teal"],    ""),
+        ("Sustaining",       str(sustaining_n),   "Project type: Sustaining",  C["lblue"],   ""),
+        ("Delayed",          str(delayed_n),       f"{round(delayed_n/total*100)}% of portfolio",
+         C["red"] if delayed_n else C["gray"], "⚠ " if delayed_n else ""),
+        ("CDM Dependent",    str(cdm_yes_n),      "Blocked pending P11 CDM",   C["amber"],   ""),
+        ("FLMC SoaP Aligned",str(flmc_n),         "FLMC Strategy on a Page",   C["navy"],    ""),
+    ]
+    for col, (lbl, val, sub, color, prefix) in zip(k, kpi_data):
+        col.markdown(f"""
+        <div class='kpi'>
+          <div class='kpi-bar' style='background:{color}'></div>
+          <div class='kpi-lbl'>{lbl}</div>
+          <div class='kpi-val' style='color:{color}'>{prefix}{val}</div>
+          <div class='kpi-sub'>{sub}</div>
+        </div>""", unsafe_allow_html=True)
 
-    sel_cdm_sb = st.multiselect("CDM Dependency", ["Yes","No","Unknown"], default=[])
-    if sel_cdm_sb:
-        base = base[base[CDM_COL].isin(sel_cdm_sb)]
+    # ── KPI Row 2 — Cost of inaction ──────────────────────────
+    st.markdown("<div style='height:10px'></div>", unsafe_allow_html=True)
+    pct_delayed = round(delayed_n/total*100) if total else 0
+    top_ok_str  = f"1 of {top_total}" if top_total else "—"
 
-    st.markdown("<div style='font-size:10px;font-weight:700;color:#9FA1A4;letter-spacing:0.07em;"
-                "text-transform:uppercase;margin:14px 0 6px 0;'>Future Filters</div>",
-                unsafe_allow_html=True)
-    for fname in ["Business Value","Dollars at Risk","Hard Deadline","Confidence Level","Dependency Criticality"]:
-        actual = fc.get(fname)
-        if actual:
-            opts = sorted(base[actual].dropna().unique().tolist())
-            sel_ff = st.multiselect(fname, opts, default=[], key=f"ff_{fname}")
-            if sel_ff:
-                base = base[base[actual].isin(sel_ff)]
-        else:
-            st.caption(f"_{fname}: not yet in data_")
-
-    st.markdown("<hr style='border:none;border-top:1px solid #E8ECF0;margin:14px 0;'>",
-                unsafe_allow_html=True)
-    st.caption(f"**{len(base)}** of {len(proj_df)} projects shown")
-    st.caption("Auto-refreshes every 60 s")
-
-filtered = base.copy()
-
-# ─── SHARED METRICS ────────────────────────────
-total = len(filtered)
-delayed_mask = pd.Series([False]*total, index=filtered.index)
-if status_col:
-    delayed_mask = filtered[status_col].str.lower().str.contains("delay", na=False)
-delayed_count = int(delayed_mask.sum())
-
-active_count = 0
-if status_col:
-    active_count = int(filtered[status_col].str.lower().str.contains(
-        "active|in progress|in-progress", na=False, regex=True).sum())
-
-teams_count = 0
-if res_df is not None and team_col_r and pid_col_r and proj_id_col:
-    ap = filtered[proj_id_col].dropna().unique()
-    rf = res_df[res_df[pid_col_r].isin(ap)]
-    teams_count = rf[team_col_r].nunique()
-
-cdm_yes_count     = int((filtered[CDM_COL]=="Yes").sum())
-cdm_unknown_count = int((filtered[CDM_COL]=="Unknown").sum())
-
-avg_impact = None
-avg_effort = None
-if impact_col:
-    v = pd.to_numeric(filtered[impact_col], errors="coerce")
-    if v.notna().any(): avg_impact = round(float(v.mean()),1)
-if effort_col:
-    v = pd.to_numeric(filtered[effort_col], errors="coerce")
-    if v.notna().any(): avg_effort = round(float(v.mean()),1)
-
-# Future field aggregates
-dollars_at_risk_total = None
-hard_deadline_count   = None
-high_value_count      = None
-
-dar_col  = fc.get("Dollars at Risk")
-hd_col   = fc.get("Hard Deadline")
-bv_col   = fc.get("Business Value")
-fv_col   = fc.get("Financial Value")
-cap_col  = fc.get("Estimated Capacity")
-dt_col   = fc.get("Deadline Type")
-dc_col   = fc.get("Dependency Criticality")
-es_col   = fc.get("Executive Sponsor")
-cl_col   = fc.get("Confidence Level")
-br_col   = fc.get("Blocker Reason")
-
-if dar_col:
-    v = pd.to_numeric(filtered[dar_col], errors="coerce")
-    if v.notna().any(): dollars_at_risk_total = v.sum()
-if hd_col:
-    hard_deadline_count = int(filtered[hd_col].notna().sum())
-if bv_col:
-    v = pd.to_numeric(filtered[bv_col], errors="coerce")
-    if v.notna().any():
-        threshold = v.quantile(0.75) if v.notna().sum() > 3 else v.max()
-        high_value_count = int((v >= threshold).sum())
-
-# Dynamic summary
-if owner_col and sel_owners:
-    o_label = f"{', '.join(sel_owners)} " if len(sel_owners)<=2 else "filtered "
-else:
-    o_label = "RevOps " if (owner_col and "RevOps" in proj_df[owner_col].values) else ""
-
-parts = [f"<strong>{total}</strong> {o_label}projects tracked"]
-if teams_count: parts.append(f"across <strong>{teams_count}</strong> teams")
-if delayed_count:
-    parts.append(f"<strong>{delayed_count}</strong> delayed program{'s' if delayed_count!=1 else ''} requiring attention")
-else:
-    parts.append("no delays currently flagged")
-dynamic_summary = ", ".join(parts[:2]) + (f", {parts[2]}" if len(parts)>2 else "") + "."
-
-# ─── SCATTER HELPER ────────────────────────────
-def scatter_effort_impact(df, height=300, show_legend=True):
-    if not effort_col or not impact_col:
-        st.warning("Effort / Impact columns not found.")
-        return
-    keep = [c for c in [proj_id_col,proj_name_col,owner_col,status_col,
-                         effort_col,impact_col,CDM_COL] if c]
-    sdf = df[keep].copy()
-    sdf[effort_col] = pd.to_numeric(sdf[effort_col], errors="coerce")
-    sdf[impact_col] = pd.to_numeric(sdf[impact_col], errors="coerce")
-    sdf = sdf.dropna(subset=[effort_col,impact_col]).reset_index(drop=True)
-    if sdf.empty:
-        st.markdown("<div class='empty-state'>No numeric data for scatter plot.</div>", unsafe_allow_html=True)
-        return
-    sdf["__x__"] = sdf[effort_col] + det_jitter(sdf.apply(lambda r: f"{r.name}_{r[effort_col]}",axis=1))
-    sdf["__y__"] = sdf[impact_col] + det_jitter(sdf.apply(lambda r: f"{r.name}_{r[impact_col]}",axis=1))
-    custom_cols = [c for c in [proj_id_col,proj_name_col,owner_col,effort_col,impact_col,CDM_COL] if c]
-    fig = px.scatter(sdf, x="__x__", y="__y__",
-                     color=status_col if status_col else None,
-                     color_discrete_map=STATUS_COLORS,
-                     custom_data=custom_cols,
-                     template="plotly_white", opacity=0.78)
-    ht = "<br>".join(
-        f"<b>{'CDM' if c==CDM_COL else c}:</b> %{{customdata[{i}]}}"
-        for i,c in enumerate(custom_cols)
-    ) + "<extra></extra>"
-    fig.update_traces(marker=dict(size=11,line=dict(width=1.5,color="white")), hovertemplate=ht)
-    fig.update_layout(xaxis_title=effort_col or "Effort", yaxis_title=impact_col or "Impact")
-    fig = chart_layout(fig, height=height, legend=show_legend)
-    st.plotly_chart(fig, use_container_width=True)
-
-
-# ─── TOP-LEVEL TABS ────────────────────────────
-_tab_config = st.tabs(["📋  Project Configuration", "📊  Executive Dashboard",
-                        "🔧  Working Team View"])
-_tab_config_obj, _tab_exec_obj, _tab_team_obj = _tab_config
-
-# ─── compatibility: map legacy view variable ───
-# Each section is now inside a `with` block below.
-
-# ══════════════════════════════════════════════
-#  EXECUTIVE DASHBOARD TAB
-# ══════════════════════════════════════════════
-with _tab_exec_obj:
     st.markdown(f"""
-    <div class="exec-header">
-      <h1>RevOps Program Dashboard</h1>
-      <div class="subtitle">Resource load, project risk, and dependency visibility</div>
-      <div class="dynamic">{dynamic_summary}</div>
-    </div>""", unsafe_allow_html=True)
+    <div style='background:linear-gradient(135deg,{C['navy']} 0%,{C['blue']} 100%);
+      border-radius:10px;padding:14px 20px;margin-bottom:4px;'>
+      <div style='font-size:10px;font-weight:700;letter-spacing:.09em;text-transform:uppercase;
+        color:rgba(255,255,255,0.6);margin-bottom:10px;'>
+        COST OF INACTION — IF NO DECISIONS ARE MADE THIS QUARTER
+      </div>
+      <div style='display:flex;gap:0;'>
+    """, unsafe_allow_html=True)
 
-    # ── KPI Row 1 ──────────────────────────────
-    k1,k2,k3,k4,k5,k6 = st.columns(6)
-    kpi_card(k1,"Total Projects",   total,         "in current filters",    accent=C["navy"])
-    kpi_card(k2,"Delayed Projects", delayed_count, "require attention",
-             color_class="danger" if delayed_count else "",
-             accent="#C0392B" if delayed_count else C["gray"])
-    kpi_card(k3,"Active Projects",  active_count,  "in progress",           accent=C["deep_blue"])
-    kpi_card(k4,"Teams Involved",   teams_count,   "across resource pool",  accent=C["teal"])
-    kpi_card(k5,"CDM Dependent",    cdm_yes_count, "depend on CDM",
-             color_class="warn" if cdm_yes_count else "", accent="#D97706")
-    kpi_card(k6,"Unknown CDM",      cdm_unknown_count, "CDM status not set",
-             color_class="warn" if cdm_unknown_count else "", accent="#D97706")
+    inaction = [
+        (f"{pct_delayed}%",  "of RevOps portfolio delayed",   f"{delayed_n} of {total} programs", C["red"]),
+        (top_ok_str,          "Top Priority programs on track", f"{top_delayed} of {top_total} already delayed", C["amber"]),
+        (str(cdm_yes_n),      "programs blocked on CDM (P11)", "Cannot start or advance",           C["amber"]),
+        (str(strat_del),      "Strategic programs slipping",   f"{strat_del} of {strategic_n} Strategic delayed", C["red"]),
+    ]
+    cols = st.columns(4)
+    for col, (val, lbl, sub, color) in zip(cols, inaction):
+        col.markdown(f"""
+        <div style='background:rgba(255,255,255,0.08);border-radius:8px;padding:12px 14px;margin:0 4px;'>
+          <div style='font-size:26px;font-weight:700;color:{color};line-height:1;'>{val}</div>
+          <div style='font-size:11px;font-weight:600;color:rgba(255,255,255,0.85);margin-top:6px;'>{lbl}</div>
+          <div style='font-size:10px;color:rgba(255,255,255,0.5);margin-top:3px;'>{sub}</div>
+        </div>""", unsafe_allow_html=True)
 
-    # ── KPI Row 2 — future fields ───────────────
-    st.markdown("<div style='margin-top:12px;'></div>", unsafe_allow_html=True)
-    fk1,fk2,fk3,fk4 = st.columns(4)
+    st.markdown("<hr class='slim'>", unsafe_allow_html=True)
 
-    if dollars_at_risk_total is not None:
-        disp = f"${dollars_at_risk_total:,.0f}"
-        kpi_card(fk1,"Dollars at Risk",disp,"estimated exposure",
-                 color_class="danger", accent="#C0392B")
-    else:
-        kpi_card(fk1,"Dollars at Risk","—","not yet captured",
-                 color_class="ph", accent=C["gray"], is_ph=True)
+    # ── Charts row ────────────────────────────────────────────
+    st.markdown("<div class='sec'>Executive Overview</div>", unsafe_allow_html=True)
+    ch1, ch2, ch3 = st.columns(3)
 
-    if high_value_count is not None:
-        kpi_card(fk2,"High-Value Projects",high_value_count,"top quartile business value",
-                 color_class="success", accent=C["teal"])
-    else:
-        kpi_card(fk2,"High-Value Projects","—","not yet captured",
-                 color_class="ph", accent=C["gray"], is_ph=True)
-
-    if hard_deadline_count is not None:
-        kpi_card(fk3,"Hard Deadlines",hard_deadline_count,"projects with fixed deadlines",
-                 color_class="warn" if hard_deadline_count else "", accent="#D97706")
-    else:
-        kpi_card(fk3,"Hard Deadlines","—","not yet captured",
-                 color_class="ph", accent=C["gray"], is_ph=True)
-
-    cl_captured = cl_col is not None
-    if cl_captured:
-        low_conf = int(filtered[cl_col].astype(str).str.lower().str.contains(
-            "low|uncertain|tbd", na=False).sum())
-        kpi_card(fk4,"Low Confidence",low_conf,"projects flagged uncertain",
-                 color_class="warn" if low_conf else "", accent="#D97706")
-    else:
-        kpi_card(fk4,"Confidence Level","—","not yet captured",
-                 color_class="ph", accent=C["gray"], is_ph=True)
-
-    if not dar_col and not hd_col and not bv_col:
-        st.markdown("<div class='ph-note'>ℹ️ Business Value, Dollars at Risk, and Hard Deadline fields are not yet "
-                    "present in the source data. Add these columns to the Excel file to enable "
-                    "financial and deadline risk analysis.</div>", unsafe_allow_html=True)
-
-    st.markdown("<hr class='section-divider'>", unsafe_allow_html=True)
-
-    if total == 0:
-        st.markdown("<div class='empty-state'>No projects match the current filters.</div>",
-                    unsafe_allow_html=True)
-        st.stop()
-
-    # ── Overview charts ────────────────────────
-    st.markdown("<div class='section-title'>Executive Overview</div>", unsafe_allow_html=True)
-    st.markdown("")
-
-    ch1,ch2 = st.columns(2)
     with ch1:
-        st.markdown(f"<div style='font-size:11px;font-weight:700;color:{C['gray']};letter-spacing:0.06em;"
-                    f"text-transform:uppercase;margin-bottom:8px;'>Top Teams by Project Load</div>",
-                    unsafe_allow_html=True)
-        if res_df is not None and team_col_r and pid_col_r and proj_id_col:
-            ap = filtered[proj_id_col].dropna().unique()
-            cr = res_df[res_df[pid_col_r].isin(ap)]
-            if not cr.empty:
-                tc = (cr.groupby(team_col_r)[pid_col_r].nunique().reset_index()
-                        .rename(columns={team_col_r:"Team",pid_col_r:"Projects"})
-                        .sort_values("Projects",ascending=True).tail(10))
-                fig = px.bar(tc,x="Projects",y="Team",orientation="h",color="Projects",
-                             color_continuous_scale=[[0,C["light_blue"]],[1,C["deep_blue"]]],
-                             template="plotly_white")
-                fig = chart_layout(fig,height=270)
-                fig.update_layout(coloraxis_showscale=False)
-                st.plotly_chart(fig,use_container_width=True)
-            else:
-                st.markdown("<div class='empty-state'>No resource data.</div>",unsafe_allow_html=True)
-        else:
-            st.warning("Resource data unavailable.")
+        st.caption("**Projects by Status**")
+        if status_c:
+            sc = revops_df[status_c].value_counts().reset_index()
+            sc.columns = ["Status","Count"]
+            colors = [STATUS_COLOR.get(s, C["gray"]) for s in sc["Status"]]
+            fig = px.bar(sc, x="Status", y="Count", color="Status",
+                         color_discrete_map=STATUS_COLOR, template="plotly_white")
+            fig.update_layout(showlegend=False)
+            st.plotly_chart(chart_base(fig,240), use_container_width=True)
 
     with ch2:
-        st.markdown(f"<div style='font-size:11px;font-weight:700;color:{C['gray']};letter-spacing:0.06em;"
-                    f"text-transform:uppercase;margin-bottom:8px;'>Portfolio Status</div>",
-                    unsafe_allow_html=True)
-        if status_col:
-            sc = filtered[status_col].value_counts().reset_index()
-            sc.columns = ["Status","Count"]
-            fig2 = px.bar(sc.sort_values("Count",ascending=False),
-                          x="Status",y="Count",color="Status",
-                          color_discrete_map=STATUS_COLORS,template="plotly_white")
-            fig2 = chart_layout(fig2,height=270)
-            fig2.update_layout(showlegend=False)
-            st.plotly_chart(fig2,use_container_width=True)
-        else:
-            st.warning("Status column not found.")
+        st.caption("**Projects by Priority Band**")
+        if band_c:
+            bc = revops_df[band_c].value_counts().reset_index()
+            bc.columns = ["Band","Count"]
+            colors = [BAND_COLOR.get(b, C["gray"]) for b in bc["Band"]]
+            fig2 = go.Figure(go.Bar(
+                x=bc["Count"], y=bc["Band"], orientation="h",
+                marker_color=colors))
+            st.plotly_chart(chart_base(fig2,240), use_container_width=True)
 
-    vis_col, risk_col = st.columns([3,2])
-    with vis_col:
-        st.markdown(f"<div style='font-size:11px;font-weight:700;color:{C['gray']};letter-spacing:0.06em;"
-                    f"text-transform:uppercase;margin-bottom:8px;'>Impact vs. Effort</div>",
-                    unsafe_allow_html=True)
-        scatter_effort_impact(filtered, height=290, show_legend=True)
+    with ch3:
+        st.caption("**CDM Dependency**")
+        cdm_c2 = revops_df[CDM].value_counts().reset_index()
+        cdm_c2.columns = ["CDM","Count"]
+        cdm_colors = {"Yes":C["amber"],"No":C["teal"],"Unknown":C["gray"]}
+        fig3 = px.pie(cdm_c2, names="CDM", values="Count",
+                      color="CDM", color_discrete_map=cdm_colors,
+                      hole=0.55, template="plotly_white")
+        fig3.update_traces(textposition="outside", textfont_size=10,
+                           marker=dict(line=dict(color="white",width=2)))
+        fig3.update_layout(height=240, margin=dict(t=8,b=8,l=8,r=8),
+                           showlegend=True, legend=dict(font=dict(size=10)),
+                           paper_bgcolor="white")
+        st.plotly_chart(fig3, use_container_width=True)
 
-    with risk_col:
-        st.markdown(f"<div style='font-size:11px;font-weight:700;color:{C['gray']};letter-spacing:0.06em;"
-                    f"text-transform:uppercase;margin-bottom:8px;'>Risk Summary</div>",
-                    unsafe_allow_html=True)
-        shown = 0
-        if delayed_count:
-            st.markdown(f"<div class='risk-item'>⚠️ <strong>{delayed_count}</strong> "
-                        f"delayed project{'s' if delayed_count!=1 else ''}</div>",
-                        unsafe_allow_html=True); shown+=1
-        if status_col and impact_col:
-            hid = filtered[delayed_mask & (pd.to_numeric(filtered[impact_col],errors="coerce")>=4)]
-            if not hid.empty:
-                st.markdown(f"<div class='risk-item'>🔴 <strong>{len(hid)}</strong> "
-                            f"delayed + high-impact</div>",unsafe_allow_html=True); shown+=1
-        if effort_col and impact_col:
-            hi_both = filtered[
-                (pd.to_numeric(filtered[effort_col],errors="coerce")>=4) &
-                (pd.to_numeric(filtered[impact_col],errors="coerce")>=4)]
-            if not hi_both.empty:
-                st.markdown(f"<div class='risk-item warn'>🔶 <strong>{len(hi_both)}</strong> "
-                            f"high-effort + high-impact</div>",unsafe_allow_html=True); shown+=1
-        if res_df is not None and team_col_r and pid_col_r and proj_id_col:
-            ap = filtered[proj_id_col].dropna().unique()
-            tdf = res_df[res_df[pid_col_r].isin(ap)]
-            if not tdf.empty:
-                grp = tdf.groupby(team_col_r)[pid_col_r].nunique()
-                tt=grp.idxmax(); tv=int(grp.max())
-                st.markdown(f"<div class='risk-item warn'>📌 <strong>{tt}</strong> — "
-                            f"highest load ({tv} projects)</div>",unsafe_allow_html=True); shown+=1
-        if cdm_yes_count:
-            st.markdown(f"<div class='risk-item info'>🔗 <strong>{cdm_yes_count}</strong> "
-                        f"CDM-dependent</div>",unsafe_allow_html=True); shown+=1
-        if cdm_unknown_count:
-            st.markdown(f"<div class='risk-item info'>❓ <strong>{cdm_unknown_count}</strong> "
-                        f"unknown CDM dependency</div>",unsafe_allow_html=True); shown+=1
-        if dollars_at_risk_total is not None:
-            st.markdown(f"<div class='risk-item warn'>💰 <strong>${dollars_at_risk_total:,.0f}</strong> "
-                        f"estimated at risk</div>",unsafe_allow_html=True); shown+=1
-        if hard_deadline_count:
-            st.markdown(f"<div class='risk-item warn'>📅 <strong>{hard_deadline_count}</strong> "
-                        f"hard deadline{'s' if hard_deadline_count!=1 else ''}</div>",
-                        unsafe_allow_html=True); shown+=1
-        if shown==0:
-            st.markdown("<div class='risk-item ok'>✅ No critical risks identified.</div>",
-                        unsafe_allow_html=True)
-
-        # Narrative
-        n_parts = []
-        if delayed_count: n_parts.append(f"{delayed_count} delayed")
-        if cdm_yes_count: n_parts.append(f"{cdm_yes_count} CDM-dependent")
-        if dollars_at_risk_total: n_parts.append(f"${dollars_at_risk_total:,.0f} estimated at risk")
-        if n_parts:
-            note = " (based on current heuristics only)" if not dar_col else ""
-            st.markdown(f"<div style='margin-top:10px;font-size:11px;color:#374151;line-height:1.5;'>"
-                        f"Key risks: {'; '.join(n_parts)}.{note}</div>",unsafe_allow_html=True)
-
-    st.markdown("<hr class='section-divider'>", unsafe_allow_html=True)
-
-    # ── Project Spotlight ──────────────────────
-    st.markdown("<div class='section-title'>Project Spotlight</div>", unsafe_allow_html=True)
-    st.markdown("<div style='font-size:12px;color:#6B7280;margin-bottom:10px;'>"
-                "Ranked by delay status, impact, and effort. Heuristic score — enrich with Business Value "
-                "and Dollars at Risk for stronger prioritisation.</div>", unsafe_allow_html=True)
-    spot = filtered.copy()
-    spot["__score__"] = 0
-    if status_col:
-        spot["__score__"] += spot[status_col].str.lower().str.contains("delay",na=False).astype(int)*10
-    if impact_col:
-        spot["__score__"] += pd.to_numeric(spot[impact_col],errors="coerce").fillna(0)
-    if effort_col:
-        spot["__score__"] += pd.to_numeric(spot[effort_col],errors="coerce").fillna(0)*0.5
-    if dar_col:
-        spot["__score__"] += pd.to_numeric(spot[dar_col],errors="coerce").fillna(0)/1000
-    spot = spot.sort_values("__score__",ascending=False).head(15)
-    sp_cols = [c for c in [proj_id_col,proj_name_col,owner_col,status_col,cycle_col,
-                            impact_col,effort_col,CDM_COL,delayed_impact_col,
-                            dar_col,hd_col,bv_col] if c]
-    disp = spot[sp_cols].rename(columns={CDM_COL:"CDM Dependency"}).reset_index(drop=True)
-    st.dataframe(disp, use_container_width=True, hide_index=True)
-
+    # ── CDM Callout ───────────────────────────────────────────
     st.markdown(f"""
-    <hr style='border:none;border-top:1px solid #E8ECF0;margin:36px 0 14px 0;'>
-    <div style='font-size:10px;color:{C["gray"]};text-align:center;padding-bottom:10px;'>
-      RevOps Program Dashboard · Executive View · Refreshes every 60 s · Source: SharePoint
-    </div>""", unsafe_allow_html=True)
-
-# ══════════════════════════════════════════════
-#  WORKING TEAM TAB
-# ══════════════════════════════════════════════
-with _tab_team_obj:
-    st.markdown(f"""
-    <div style="background:linear-gradient(135deg,{C['green']} 0%,{C['teal']} 100%);
-      border-radius:12px;padding:18px 24px;color:white;margin-bottom:20px;">
-      <div style="font-size:18px;font-weight:700;">RevOps Working Team View</div>
-      <div style="font-size:12px;color:rgba(255,255,255,0.65);margin-top:3px;">{dynamic_summary}</div>
-    </div>""", unsafe_allow_html=True)
-
-    em_col,_ = st.columns([2,6])
-    with em_col:
-        edit_mode = st.toggle("✏️ Edit Mode", value=st.session_state["edit_mode"])
-        st.session_state["edit_mode"] = edit_mode
-    if edit_mode:
-        st.markdown("<div class='edit-banner'>⚠️ <strong>Edit Mode ON.</strong> "
-                    "Edits stored in session only — not saved to OneDrive.</div>",
-                    unsafe_allow_html=True)
-
-    # ── KPI Row ────────────────────────────────
-    k1,k2,k3,k4,k5,k6 = st.columns(6)
-    kpi_card(k1,"Total Projects",   total,             "in current filters",   accent=C["navy"])
-    kpi_card(k2,"Delayed Projects", delayed_count,     "require attention",
-             color_class="danger" if delayed_count else "",
-             accent="#C0392B" if delayed_count else C["gray"])
-    kpi_card(k3,"Active Projects",  active_count,      "in progress",          accent=C["deep_blue"])
-    kpi_card(k4,"Teams Involved",   teams_count,       "across resource pool", accent=C["teal"])
-    kpi_card(k5,"CDM Dependent",    cdm_yes_count,     "depend on CDM",
-             color_class="warn" if cdm_yes_count else "", accent="#D97706")
-    kpi_card(k6,"Unknown CDM",      cdm_unknown_count, "CDM status not set",
-             color_class="warn" if cdm_unknown_count else "", accent="#D97706")
-
-    st.markdown("<hr class='section-divider'>", unsafe_allow_html=True)
-
-    if total == 0:
-        st.markdown("<div class='empty-state'>No projects match the current filters.</div>",
-                    unsafe_allow_html=True)
-        st.stop()
-
-    # ── Portfolio Analysis ──────────────────────
-    st.markdown("<div class='section-title'>Portfolio Analysis</div>", unsafe_allow_html=True)
-    st.markdown("")
-
-    pa1,pa2 = st.columns(2)
-    with pa1:
-        st.markdown(f"<div style='font-size:11px;font-weight:700;color:{C['gray']};letter-spacing:0.06em;"
-                    f"text-transform:uppercase;margin-bottom:8px;'>Projects by Team</div>",
-                    unsafe_allow_html=True)
-        team_drill_opts = ["All Teams"]
-        if res_df is not None and team_col_r and pid_col_r and proj_id_col:
-            ap = filtered[proj_id_col].dropna().unique()
-            cr = res_df[res_df[pid_col_r].isin(ap)]
-            if not cr.empty:
-                tc = (cr.groupby(team_col_r)[pid_col_r].nunique().reset_index()
-                        .rename(columns={team_col_r:"Team",pid_col_r:"Projects"})
-                        .sort_values("Projects",ascending=True))
-                team_drill_opts = ["All Teams"]+tc["Team"].tolist()
-                fig = px.bar(tc,x="Projects",y="Team",orientation="h",color="Projects",
-                             color_continuous_scale=[[0,C["light_blue"]],[1,C["deep_blue"]]],
-                             template="plotly_white")
-                fig = chart_layout(fig,height=300)
-                fig.update_layout(coloraxis_showscale=False)
-                st.plotly_chart(fig,use_container_width=True)
-        else:
-            st.warning("Resource data unavailable.")
-        drill_team = st.selectbox("🔍 Drill into team", team_drill_opts, key="drill_team_sel")
-
-    with pa2:
-        st.markdown(f"<div style='font-size:11px;font-weight:700;color:{C['gray']};letter-spacing:0.06em;"
-                    f"text-transform:uppercase;margin-bottom:8px;'>Projects by Status</div>",
-                    unsafe_allow_html=True)
-        status_drill_opts = ["All Statuses"]
-        if status_col:
-            sc = filtered[status_col].value_counts().reset_index()
-            sc.columns = ["Status","Count"]
-            sc = sc.sort_values("Count",ascending=False)
-            status_drill_opts = ["All Statuses"]+sc["Status"].tolist()
-            fig2 = px.bar(sc,x="Status",y="Count",color="Status",
-                          color_discrete_map=STATUS_COLORS,template="plotly_white")
-            fig2 = chart_layout(fig2,height=300)
-            fig2.update_layout(showlegend=False)
-            st.plotly_chart(fig2,use_container_width=True)
-        else:
-            st.warning("Status column not found.")
-        drill_status = st.selectbox("🔍 Drill into status", status_drill_opts, key="drill_status_sel")
-
-    pa3,pa4 = st.columns(2)
-    with pa3:
-        st.markdown(f"<div style='font-size:11px;font-weight:700;color:{C['gray']};letter-spacing:0.06em;"
-                    f"text-transform:uppercase;margin-bottom:8px;margin-top:12px;'>Impact vs. Effort</div>",
-                    unsafe_allow_html=True)
-        scatter_effort_impact(filtered, height=290, show_legend=True)
-
-    with pa4:
-        st.markdown(f"<div style='font-size:11px;font-weight:700;color:{C['gray']};letter-spacing:0.06em;"
-                    f"text-transform:uppercase;margin-bottom:8px;margin-top:12px;'>Priority Distribution</div>",
-                    unsafe_allow_html=True)
-        if priority_col:
-            pc = filtered[priority_col].value_counts().reset_index()
-            pc.columns = ["Priority","Count"]
-            fig4 = px.pie(pc,names="Priority",values="Count",
-                          color_discrete_sequence=PALETTE,hole=0.50,template="plotly_white")
-            fig4.update_traces(textposition="outside",textfont_size=10,
-                               marker=dict(line=dict(color="white",width=2)))
-            fig4.update_layout(height=260,margin=dict(t=8,b=8,l=8,r=8),showlegend=True,
-                                legend=dict(font=dict(size=10)),paper_bgcolor="white",
-                                font=dict(family="Inter, sans-serif"))
-            st.plotly_chart(fig4,use_container_width=True)
-        else:
-            st.info("Priority column not found.")
-
-    # Delayed table
-    st.markdown(f"<div style='font-size:11px;font-weight:700;color:{C['gray']};letter-spacing:0.06em;"
-                f"text-transform:uppercase;margin-bottom:8px;margin-top:4px;'>Delayed Projects</div>",
-                unsafe_allow_html=True)
-    if status_col:
-        del_df = filtered[delayed_mask].copy()
-        dcols = [c for c in [proj_id_col,proj_name_col,owner_col,status_col,cycle_col,
-                              impact_col,effort_col,delayed_impact_col,CDM_COL,
-                              dar_col,hd_col] if c]
-        if not del_df.empty and dcols:
-            st.dataframe(del_df[dcols].rename(columns={CDM_COL:"CDM Dependency"})
-                         .reset_index(drop=True), use_container_width=True, hide_index=True)
-        else:
-            st.markdown(f"<div style='color:{C['teal']};font-size:12px;padding:6px 0;'>"
-                        f"✅ No delayed projects in current view.</div>", unsafe_allow_html=True)
-
-    # CDM breakdown
-    st.markdown(f"<div style='font-size:11px;font-weight:700;color:{C['gray']};letter-spacing:0.06em;"
-                f"text-transform:uppercase;margin-bottom:8px;margin-top:18px;'>CDM Dependency Breakdown</div>",
-                unsafe_allow_html=True)
-    cdm_counts = filtered[CDM_COL].value_counts().reset_index()
-    cdm_counts.columns = ["CDM Status","Count"]
-    fig_cdm = px.bar(cdm_counts,x="CDM Status",y="Count",color="CDM Status",
-                     color_discrete_map={"Yes":"#D97706","No":C["teal"],"Unknown":C["gray"]},
-                     template="plotly_white")
-    fig_cdm = chart_layout(fig_cdm,height=200)
-    fig_cdm.update_layout(showlegend=False)
-    st.plotly_chart(fig_cdm,use_container_width=True)
-
-    st.markdown("<hr class='section-divider'>", unsafe_allow_html=True)
-
-    # ── Interactive Insights ────────────────────
-    st.markdown("<div class='section-title'>Interactive Insights</div>", unsafe_allow_html=True)
-    st.markdown("")
-    ins1,ins2,ins3,ins4 = st.columns(4)
-    with ins1:
-        ins_teams = ["All Teams"]
-        if team_col_p: ins_teams += sorted(filtered[team_col_p].dropna().unique().tolist())
-        elif res_df is not None and team_col_r: ins_teams += sorted(res_df[team_col_r].dropna().unique().tolist())
-        ins_team = st.selectbox("By Team", ins_teams)
-    with ins2:
-        ins_statuses = ["All Statuses"]
-        if status_col: ins_statuses += sorted(filtered[status_col].dropna().unique().tolist())
-        ins_status = st.selectbox("By Status", ins_statuses)
-    with ins3:
-        ins_cdm = st.selectbox("By CDM", ["All","Yes","No","Unknown"])
-    with ins4:
-        proj_opts = ["All Projects"]
-        if proj_name_col: proj_opts += sorted(filtered[proj_name_col].dropna().unique().tolist())
-        ins_proj = st.selectbox("By Project", proj_opts)
-
-    ins_df = filtered.copy()
-    if ins_team != "All Teams":
-        if team_col_p and team_col_p in ins_df.columns:
-            ins_df = ins_df[ins_df[team_col_p]==ins_team]
-        elif res_df is not None and team_col_r and pid_col_r and proj_id_col:
-            pids = res_df[res_df[team_col_r]==ins_team][pid_col_r].unique()
-            ins_df = ins_df[ins_df[proj_id_col].isin(pids)]
-    if ins_status != "All Statuses" and status_col:
-        ins_df = ins_df[ins_df[status_col]==ins_status]
-    if ins_cdm != "All":
-        ins_df = ins_df[ins_df[CDM_COL]==ins_cdm]
-    if ins_proj != "All Projects" and proj_name_col:
-        ins_df = ins_df[ins_df[proj_name_col]==ins_proj]
-
-    st.markdown(f"<div style='font-size:12px;color:#6B7280;margin-bottom:10px;'>"
-                f"<strong>{len(ins_df)}</strong> projects match selected filters.</div>",
-                unsafe_allow_html=True)
-
-    if not ins_df.empty:
-        il,ir = st.columns([3,2])
-        with il:
-            ins_cols = [c for c in [proj_id_col,proj_name_col,owner_col,status_col,
-                                     cycle_col,impact_col,effort_col,CDM_COL,
-                                     dar_col,cl_col,dc_col] if c]
-            st.dataframe(ins_df[ins_cols].rename(columns={CDM_COL:"CDM Dependency"})
-                         .reset_index(drop=True), use_container_width=True, hide_index=True, height=280)
-        with ir:
-            if res_df is not None and team_col_r and pid_col_r and proj_id_col:
-                ap_i = ins_df[proj_id_col].dropna().unique()
-                rf_i = res_df[res_df[pid_col_r].isin(ap_i)]
-                if not rf_i.empty:
-                    imp_t = rf_i[team_col_r].value_counts().head(8).reset_index()
-                    imp_t.columns = ["Team","Projects"]
-                    st.markdown(f"<div style='font-size:11px;font-weight:700;color:{C['gray']};"
-                                f"letter-spacing:0.06em;text-transform:uppercase;margin-bottom:6px;'>"
-                                f"Impacted Teams</div>", unsafe_allow_html=True)
-                    fig_it = px.bar(imp_t.sort_values("Projects",ascending=True),
-                                    x="Projects",y="Team",orientation="h",color="Projects",
-                                    color_continuous_scale=[[0,C["soft_green"]],[1,C["green"]]],
-                                    template="plotly_white")
-                    fig_it = chart_layout(fig_it,height=220)
-                    fig_it.update_layout(coloraxis_showscale=False)
-                    st.plotly_chart(fig_it,use_container_width=True)
-            if dep_df is not None and proj_id_col:
-                dep_pid = get_col(dep_df,"Project ID","ProjectID","ID","Dependent Project ID")
-                if dep_pid:
-                    dm = dep_df[dep_df[dep_pid].isin(ins_df[proj_id_col].dropna().unique())]
-                    if not dm.empty:
-                        st.markdown(f"<div style='font-size:11px;font-weight:700;color:{C['gray']};"
-                                    f"letter-spacing:0.06em;text-transform:uppercase;"
-                                    f"margin-bottom:6px;margin-top:10px;'>Related Dependencies</div>",
-                                    unsafe_allow_html=True)
-                        st.dataframe(dm.head(10).reset_index(drop=True),
-                                     use_container_width=True, hide_index=True, height=140)
-    else:
-        st.markdown("<div class='empty-state'>No projects match this combination.</div>",
-                    unsafe_allow_html=True)
-
-    st.markdown("<hr class='section-divider'>", unsafe_allow_html=True)
-
-    # ── Risk Insights ───────────────────────────
-    st.markdown("<div class='section-title'>Risk Insights</div>", unsafe_allow_html=True)
-    st.markdown("")
-
-    ri1,ri2 = st.columns([2,3])
-    with ri1:
-        r_shown=0
-        if delayed_count:
-            st.markdown(f"<div class='risk-item'>⚠️ <strong>{delayed_count}</strong> "
-                        f"delayed project{'s' if delayed_count!=1 else ''}</div>",
-                        unsafe_allow_html=True); r_shown+=1
-        if status_col and impact_col:
-            hid = filtered[delayed_mask & (pd.to_numeric(filtered[impact_col],errors="coerce")>=4)]
-            if not hid.empty:
-                st.markdown(f"<div class='risk-item'>🔴 <strong>{len(hid)}</strong> "
-                            f"delayed + high-impact</div>",unsafe_allow_html=True); r_shown+=1
-        if effort_col and impact_col:
-            hi_both = filtered[
-                (pd.to_numeric(filtered[effort_col],errors="coerce")>=4) &
-                (pd.to_numeric(filtered[impact_col],errors="coerce")>=4)]
-            if not hi_both.empty:
-                st.markdown(f"<div class='risk-item warn'>🔶 <strong>{len(hi_both)}</strong> "
-                            f"high-effort + high-impact</div>",unsafe_allow_html=True); r_shown+=1
-        if res_df is not None and team_col_r and pid_col_r and proj_id_col:
-            ap = filtered[proj_id_col].dropna().unique()
-            tdf = res_df[res_df[pid_col_r].isin(ap)]
-            if not tdf.empty:
-                grp=tdf.groupby(team_col_r)[pid_col_r].nunique()
-                tt=grp.idxmax(); tv=int(grp.max())
-                st.markdown(f"<div class='risk-item warn'>📌 <strong>{tt}</strong> — "
-                            f"highest load ({tv} projects)</div>",unsafe_allow_html=True); r_shown+=1
-        if cdm_yes_count:
-            st.markdown(f"<div class='risk-item info'>🔗 <strong>{cdm_yes_count}</strong> "
-                        f"CDM-dependent</div>",unsafe_allow_html=True); r_shown+=1
-        if cdm_unknown_count:
-            st.markdown(f"<div class='risk-item info'>❓ <strong>{cdm_unknown_count}</strong> "
-                        f"unknown CDM dependency</div>",unsafe_allow_html=True); r_shown+=1
-        if priority_col:
-            high_pri = filtered[filtered[priority_col].astype(str).str.lower()
-                                .str.contains("high|critical|p1",na=False)]
-            if not high_pri.empty:
-                st.markdown(f"<div class='risk-item info'>🔵 <strong>{len(high_pri)}</strong> "
-                            f"high-priority project{'s' if len(high_pri)!=1 else ''}</div>",
-                            unsafe_allow_html=True); r_shown+=1
-        if dollars_at_risk_total is not None:
-            st.markdown(f"<div class='risk-item warn'>💰 <strong>${dollars_at_risk_total:,.0f}</strong> "
-                        f"estimated at risk</div>",unsafe_allow_html=True); r_shown+=1
-        else:
-            st.markdown("<div class='risk-item muted'>💰 Dollars at Risk: not yet captured</div>",
-                        unsafe_allow_html=True)
-        if hard_deadline_count:
-            st.markdown(f"<div class='risk-item warn'>📅 <strong>{hard_deadline_count}</strong> "
-                        f"hard deadline{'s' if hard_deadline_count!=1 else ''}</div>",
-                        unsafe_allow_html=True); r_shown+=1
-        else:
-            st.markdown("<div class='risk-item muted'>📅 Hard Deadlines: not yet captured</div>",
-                        unsafe_allow_html=True)
-        if r_shown==0:
-            st.markdown("<div class='risk-item ok'>✅ No critical risks identified.</div>",
-                        unsafe_allow_html=True)
-
-    with ri2:
-        n_parts=[]
-        if delayed_count: n_parts.append(f"{delayed_count} delayed project{'s' if delayed_count!=1 else ''}")
-        if status_col and impact_col:
-            hid2 = filtered[delayed_mask & (pd.to_numeric(filtered[impact_col],errors="coerce")>=4)]
-            if not hid2.empty: n_parts.append(f"{len(hid2)} with high impact score")
-        if effort_col and impact_col:
-            hi2 = filtered[
-                (pd.to_numeric(filtered[effort_col],errors="coerce")>=4) &
-                (pd.to_numeric(filtered[impact_col],errors="coerce")>=4)]
-            if not hi2.empty: n_parts.append(f"{len(hi2)} requiring high effort and high impact")
-        if cdm_yes_count: n_parts.append(f"{cdm_yes_count} dependent on CDM delivery")
-        if cdm_unknown_count: n_parts.append(f"{cdm_unknown_count} with unresolved CDM status")
-        if dollars_at_risk_total: n_parts.append(f"${dollars_at_risk_total:,.0f} estimated at risk")
-        if res_df is not None and team_col_r and pid_col_r and proj_id_col:
-            ap3 = filtered[proj_id_col].dropna().unique()
-            tdf3 = res_df[res_df[pid_col_r].isin(ap3)]
-            if not tdf3.empty:
-                grp3=tdf3.groupby(team_col_r)[pid_col_r].nunique()
-                n_parts.append(f"{grp3.idxmax()} carrying the highest load at {int(grp3.max())} projects")
-
-        heuristic_note = (" Recommendations based on current heuristics only — add Business Value, "
-                          "Dollars at Risk, and Hard Deadline fields for stronger prioritisation."
-                          if not dar_col and not bv_col and not hd_col else
-                          " Some prioritisation fields are present; remaining recommendations "
-                          "supplemented by heuristics where data is absent.")
-        if n_parts:
-            narrative = ("The current portfolio shows: " + "; ".join(n_parts) + ". " +
-                         "Review prioritisation and resource allocation to reduce delivery risk." +
-                         heuristic_note)
-        else:
-            narrative = "Portfolio appears on track with no major risks under current filters." + heuristic_note
-
-        st.markdown(f"""
-        <div class="insight-box">
-          <div style="font-size:11px;font-weight:700;color:{C['gray']};letter-spacing:0.06em;
-            text-transform:uppercase;margin-bottom:8px;">Dynamic Risk Narrative</div>
-          <div style="font-size:13px;color:#374151;line-height:1.6;">{narrative}</div>
-        </div>""", unsafe_allow_html=True)
-
-        if effort_col and impact_col:
-            hi_risk = filtered[
-                (pd.to_numeric(filtered[effort_col],errors="coerce")>=4) &
-                (pd.to_numeric(filtered[impact_col],errors="coerce")>=4)].copy()
-            if not hi_risk.empty:
-                st.markdown(f"<div style='font-size:11px;font-weight:700;color:{C['gray']};"
-                            f"letter-spacing:0.06em;text-transform:uppercase;"
-                            f"margin-bottom:6px;margin-top:10px;'>High Effort + High Impact</div>",
-                            unsafe_allow_html=True)
-                hr_cols = [c for c in [proj_id_col,proj_name_col,owner_col,status_col,
-                                        effort_col,impact_col,CDM_COL,dar_col] if c]
-                st.dataframe(hi_risk[hr_cols].rename(columns={CDM_COL:"CDM Dependency"})
-                             .reset_index(drop=True),
-                             use_container_width=True, hide_index=True, height=160)
-
-    st.markdown("<hr class='section-divider'>", unsafe_allow_html=True)
-
-    # ── Decision Inputs Panel ───────────────────
-    st.markdown("<div class='section-title'>Decision Inputs to Add</div>", unsafe_allow_html=True)
-    st.markdown("<div style='font-size:12px;color:#6B7280;margin-bottom:14px;'>"
-                "These fields would significantly strengthen portfolio prioritisation. "
-                "Add them to the source Excel file to unlock richer analysis.</div>",
-                unsafe_allow_html=True)
-    for fname, cands, why in FUTURE_FIELDS:
-        actual = fc.get(fname)
-        badge = (f"<span class='ff-badge-yes'>✓ Available</span>" if actual
-                 else f"<span class='ff-badge-no'>Not yet captured</span>")
-        st.markdown(f"""
-        <div class="ff-card">
-          <div class="ff-name">{fname}</div>
-          <div class="ff-why">{why}</div>
-          <div>{badge}</div>
-        </div>""", unsafe_allow_html=True)
-
-    st.markdown("<hr class='section-divider'>", unsafe_allow_html=True)
-
-    # ── Project Explorer ───────────────────────
-    st.markdown("<div class='section-title'>Project Explorer</div>", unsafe_allow_html=True)
-    st.markdown("")
-
-    if proj_name_col:
-        proj_opts_ex = sorted(filtered[proj_name_col].dropna().unique().tolist())
-    elif proj_id_col:
-        proj_opts_ex = sorted(filtered[proj_id_col].dropna().astype(str).unique().tolist())
-    else:
-        proj_opts_ex = []
-
-    if not proj_opts_ex:
-        st.markdown("<div class='empty-state'>No projects available.</div>",unsafe_allow_html=True)
-    else:
-        sel_proj = st.selectbox("Select a project to explore", proj_opts_ex)
-        prow_df = (filtered[filtered[proj_name_col]==sel_proj] if proj_name_col
-                   else filtered[filtered[proj_id_col].astype(str)==sel_proj])
-
-        if not prow_df.empty:
-            row = prow_df.iloc[0]
-            proj_status = row.get(status_col,"") if status_col else ""
-            is_delayed  = "delay" in str(proj_status).lower()
-            badge_h     = status_badge_html(proj_status) if proj_status else ""
-            pid_disp    = (f"<span style='color:{C['gray']};font-size:12px;margin-left:8px;'>"
-                           f"{row.get(proj_id_col,'')}</span>" if proj_id_col else "")
-            cdm_val     = row.get(CDM_COL,"Unknown")
-            cdm_color   = {"Yes":"#D97706","No":C["teal"],"Unknown":C["gray"]}.get(cdm_val,C["gray"])
-
-            st.markdown(f"""
-            <div class="detail-card" style="border-left:4px solid {'#C0392B' if is_delayed else C['deep_blue']};">
-              <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;">
-                <span style="font-size:16px;font-weight:700;color:{C['navy']};">{sel_proj}</span>
-                {pid_disp} {badge_h}
-                <span class='status-badge' style='background:#FEF3C7;color:{cdm_color};'>CDM: {cdm_val}</span>
-              </div>
-              <div style="margin-top:5px;font-size:11px;color:#C0392B;">
-                {'⚠️ Flagged as delayed.' if is_delayed else ''}
-              </div>
-            </div>""", unsafe_allow_html=True)
-
-            tab1,tab2,tab3,tab4,tab5 = st.tabs(
-                ["Overview","Resources","Dependencies","Risk & Impact","Business & Decision"])
-
-            # ── Tab 1: Overview ────────────────
-            with tab1:
-                meta = [c for c in [proj_id_col,owner_col,team_col_p,status_col,
-                                     cycle_col,priority_col,effort_col,impact_col,CDM_COL] if c]
-                if meta:
-                    pairs = [(c,row.get(c,"—")) for c in meta]
-                    half  = len(pairs)//2 + len(pairs)%2
-                    m1,m2 = st.columns(2)
-                    for cn,cv in pairs[:half]:
-                        lbl = "CDM Dependency" if cn==CDM_COL else cn
-                        m1.markdown(f"""
-                        <div style="margin-bottom:12px;">
-                          <div class="detail-label">{lbl}</div>
-                          <div class="detail-value">{cv if cv==cv and str(cv).strip()!='' else '—'}</div>
-                        </div>""", unsafe_allow_html=True)
-                    for cn,cv in pairs[half:]:
-                        lbl = "CDM Dependency" if cn==CDM_COL else cn
-                        m2.markdown(f"""
-                        <div style="margin-bottom:12px;">
-                          <div class="detail-label">{lbl}</div>
-                          <div class="detail-value">{cv if cv==cv and str(cv).strip()!='' else '—'}</div>
-                        </div>""", unsafe_allow_html=True)
-                if notes_col and row.get(notes_col):
-                    st.markdown(f"""
-                    <div class="detail-card" style="background:#FFFBF0;border-left:3px solid #D97706;">
-                      <div class="detail-label">Notes</div>
-                      <div style="font-size:12px;color:#374151;margin-top:3px;">{row.get(notes_col)}</div>
-                    </div>""", unsafe_allow_html=True)
-
-                if edit_mode:
-                    st.markdown(f"<div style='font-size:11px;font-weight:700;color:{C['gray']};"
-                                f"letter-spacing:0.06em;text-transform:uppercase;margin:14px 0 8px 0;'>"
-                                f"Edit Core Fields</div>", unsafe_allow_html=True)
-                    proj_key = str(row.get(proj_id_col, sel_proj))
-                    edits = st.session_state["edits"].setdefault(proj_key, {})
-                    e1,e2 = st.columns(2)
-                    if status_col:
-                        all_s = sorted(proj_df[status_col].dropna().unique().tolist())
-                        cur_s = row.get(status_col)
-                        edits["status"] = e1.selectbox("Status",all_s,
-                            index=all_s.index(cur_s) if cur_s in all_s else 0,
-                            key=f"es_{proj_key}")
-                    if owner_col:
-                        edits["owner"] = e2.text_input("Owner",
-                            value=str(row.get(owner_col,"")), key=f"eo_{proj_key}")
-                    if impact_col:
-                        edits["impact"] = e1.text_input("Impact",
-                            value=str(row.get(impact_col,"")), key=f"ei_{proj_key}")
-                    if effort_col:
-                        edits["effort"] = e2.text_input("Effort",
-                            value=str(row.get(effort_col,"")), key=f"ef_{proj_key}")
-                    if notes_col:
-                        edits["notes"] = st.text_area("Notes",
-                            value=str(row.get(notes_col,"")), key=f"en_{proj_key}")
-                    st.session_state["edits"][proj_key] = edits
-                    st.markdown("<div class='edit-banner' style='margin-top:8px;'>"
-                                "Session edits stored. Writeback to OneDrive not yet implemented.</div>",
-                                unsafe_allow_html=True)
-
-            # ── Tab 2: Resources ───────────────
-            with tab2:
-                if res_df is not None and proj_id_col and pid_col_r:
-                    pid_v = row.get(proj_id_col)
-                    pr = res_df[res_df[pid_col_r]==pid_v]
-                    if not pr.empty:
-                        st.dataframe(pr.reset_index(drop=True),use_container_width=True,hide_index=True)
-                        if team_col_r:
-                            tl = pr[team_col_r].dropna().unique().tolist()
-                            st.markdown(f"<div style='font-size:11px;color:{C['gray']};margin-top:6px;'>"
-                                        f"Teams: {', '.join(str(t) for t in tl)}</div>",
-                                        unsafe_allow_html=True)
-                    else:
-                        st.markdown("<div class='empty-state'>No resources linked.</div>",
-                                    unsafe_allow_html=True)
-                else:
-                    st.warning("Resource data or Project ID unavailable.")
-
-            # ── Tab 3: Dependencies ────────────
-            with tab3:
-                if dep_df is not None:
-                    dep_pid_col2 = get_col(dep_df,"Project ID","ProjectID","ID","Dependent Project ID")
-                    if proj_id_col and dep_pid_col2:
-                        pd_dep = dep_df[dep_df[dep_pid_col2]==row.get(proj_id_col)]
-                        if not pd_dep.empty:
-                            st.dataframe(pd_dep.reset_index(drop=True),
-                                         use_container_width=True,hide_index=True)
-                        else:
-                            st.markdown("<div class='empty-state'>No dependencies recorded.</div>",
-                                        unsafe_allow_html=True)
-                    else:
-                        st.warning("Project ID column missing in Dependencies.")
-                else:
-                    st.warning("Dependencies sheet not available.")
-
-            # ── Tab 4: Risk & Impact ───────────
-            with tab4:
-                r1,r2 = st.columns(2)
-                with r1:
-                    if impact_col:
-                        iv = pd.to_numeric(row.get(impact_col),errors="coerce")
-                        ic = C["teal"] if pd.notna(iv) and iv>=3 else C["gray"]
-                        st.markdown(f"""
-                        <div class="detail-card">
-                          <div class="detail-label">Impact Score</div>
-                          <div class="kpi-value" style="font-size:28px;color:{ic};">
-                            {iv if pd.notna(iv) else '—'}</div>
-                        </div>""", unsafe_allow_html=True)
-                    if effort_col:
-                        ev = pd.to_numeric(row.get(effort_col),errors="coerce")
-                        st.markdown(f"""
-                        <div class="detail-card">
-                          <div class="detail-label">Effort Score</div>
-                          <div class="kpi-value" style="font-size:28px;color:{C['deep_blue']};">
-                            {ev if pd.notna(ev) else '—'}</div>
-                        </div>""", unsafe_allow_html=True)
-                    st.markdown(f"""
-                    <div class="detail-card">
-                      <div class="detail-label">CDM Dependency</div>
-                      <div style="font-size:16px;font-weight:600;color:{cdm_color};margin-top:2px;">
-                        {cdm_val}</div>
-                    </div>""", unsafe_allow_html=True)
-                with r2:
-                    if delayed_impact_col:
-                        div_v = row.get(delayed_impact_col,"—")
-                        st.markdown(f"""
-                        <div class="detail-card" style="border-left:3px solid #C0392B;">
-                          <div class="detail-label">If Delayed Impact</div>
-                          <div style="font-size:13px;font-weight:500;color:#C0392B;margin-top:3px;">
-                            {div_v if div_v==div_v else '—'}</div>
-                        </div>""", unsafe_allow_html=True)
-                    flag_bg  = "#FEF3F2" if is_delayed else "#F0FFF8"
-                    flag_brd = "#C0392B" if is_delayed else C["teal"]
-                    flag_clr = "#C0392B" if is_delayed else C["teal"]
-                    flag_txt = "⚠️ Delay Flag Active" if is_delayed else "✅ No Delay Flag"
-                    flag_sub = "Review ownership and blockers." if is_delayed else "Not currently delayed."
-                    st.markdown(f"""
-                    <div class="detail-card" style="background:{flag_bg};border-left:3px solid {flag_brd};">
-                      <div style="font-size:12px;color:{flag_clr};font-weight:700;">{flag_txt}</div>
-                      <div style="font-size:11px;color:#374151;margin-top:3px;">{flag_sub}</div>
-                    </div>""", unsafe_allow_html=True)
-                    if notes_col and row.get(notes_col):
-                        st.markdown(f"""
-                        <div class="detail-card" style="background:#FFFBF0;border-left:3px solid #D97706;">
-                          <div class="detail-label">Risk Notes</div>
-                          <div style="font-size:11px;color:#374151;margin-top:3px;">{row.get(notes_col)}</div>
-                        </div>""", unsafe_allow_html=True)
-
-            # ── Tab 5: Business & Decision ──────
-            with tab5:
-                st.markdown(f"<div style='font-size:11px;color:{C['gray']};margin-bottom:14px;line-height:1.5;'>"
-                            f"These fields support stronger portfolio prioritisation. "
-                            f"Fields marked <em>Not yet captured</em> are not present in the current "
-                            f"source data — add them to the Excel file to enable richer analysis.</div>",
-                            unsafe_allow_html=True)
-                bd1,bd2 = st.columns(2)
-                left_ff  = ["Business Value","Financial Value","Dollars at Risk",
-                             "Estimated Capacity","Hard Deadline"]
-                right_ff = ["Deadline Type","Dependency Criticality","Executive Sponsor",
-                             "Confidence Level","Blocker Reason"]
-
-                for fname in left_ff:
-                    actual = fc.get(fname)
-                    v = fval(row, actual)
-                    ph_class = " ph" if v=="Not yet captured" else ""
-                    bd1.markdown(f"""
-                    <div style="margin-bottom:14px;">
-                      <div class="detail-label">{fname}</div>
-                      <div class="detail-value{ph_class}">{v}</div>
-                    </div>""", unsafe_allow_html=True)
-
-                for fname in right_ff:
-                    actual = fc.get(fname)
-                    v = fval(row, actual)
-                    ph_class = " ph" if v=="Not yet captured" else ""
-                    bd2.markdown(f"""
-                    <div style="margin-bottom:14px;">
-                      <div class="detail-label">{fname}</div>
-                      <div class="detail-value{ph_class}">{v}</div>
-                    </div>""", unsafe_allow_html=True)
-
-                if edit_mode:
-                    st.markdown(f"<div style='font-size:11px;font-weight:700;color:{C['gray']};"
-                                f"letter-spacing:0.06em;text-transform:uppercase;margin:16px 0 10px 0;'>"
-                                f"Edit Decision Fields (Future-Ready)</div>", unsafe_allow_html=True)
-                    proj_key = str(row.get(proj_id_col, sel_proj))
-                    edits = st.session_state["edits"].setdefault(proj_key, {})
-                    ff_fields_edit = [
-                        ("Business Value",    "bv",  "text"),
-                        ("Financial Value",   "fval", "text"),
-                        ("Dollars at Risk",   "dar",  "text"),
-                        ("Estimated Capacity","cap",  "text"),
-                        ("Hard Deadline",     "hd",   "text"),
-                        ("Deadline Type",     "dt",   "select",
-                         ["","Regulatory","Contractual","Internal","Aspirational"]),
-                        ("Dependency Criticality","dc","select",
-                         ["","High","Medium","Low","None"]),
-                        ("Executive Sponsor", "es",   "text"),
-                        ("Confidence Level",  "cl",   "select",
-                         ["","High","Medium","Low","Unknown"]),
-                        ("Blocker Reason",    "br",   "text"),
-                    ]
-                    fe1,fe2 = st.columns(2)
-                    for i,ff_def in enumerate(ff_fields_edit):
-                        fname_f = ff_def[0]; fkey_f = ff_def[1]; ftype_f = ff_def[2]
-                        actual_f = fc.get(fname_f)
-                        cur_val  = str(row.get(actual_f,"")) if actual_f else ""
-                        target   = fe1 if i%2==0 else fe2
-                        label_f  = fname_f + ("" if actual_f else " (placeholder)")
-                        if ftype_f=="select":
-                            opts_f = ff_def[3]
-                            idx_f  = opts_f.index(cur_val) if cur_val in opts_f else 0
-                            edits[fkey_f] = target.selectbox(
-                                label_f, opts_f, index=idx_f, key=f"ffe_{fkey_f}_{proj_key}")
-                        else:
-                            edits[fkey_f] = target.text_input(
-                                label_f, value=cur_val, key=f"ffe_{fkey_f}_{proj_key}",
-                                placeholder="Not yet captured")
-                    st.session_state["edits"][proj_key] = edits
-                    st.markdown("<div class='edit-banner' style='margin-top:10px;'>"
-                                "Decision field edits stored in session only. "
-                                "Writeback to OneDrive not yet implemented.</div>",
-                                unsafe_allow_html=True)
-
-    st.markdown(f"""
-    <hr style='border:none;border-top:1px solid #E8ECF0;margin:36px 0 14px 0;'>
-    <div style='font-size:10px;color:{C["gray"]};text-align:center;padding-bottom:10px;'>
-      RevOps Program Dashboard · Working Team View · Refreshes every 60 s · Source: SharePoint
-    </div>""", unsafe_allow_html=True)
-
-# ══════════════════════════════════════════════════════════════
-#  PROJECT CONFIGURATION TAB
-# ══════════════════════════════════════════════════════════════
-with _tab_config_obj:
-
-    # ── helpers ───────────────────────────────────────────────
-    def _safe_num(val, fallback=""):
-        try:
-            v = pd.to_numeric(val, errors="coerce")
-            return "" if pd.isna(v) else v
-        except Exception:
-            return fallback
-
-    # Work from session-state editable copies
-    edit_proj = st.session_state["proj_edits"].copy()
-    edit_vm   = st.session_state["vm_edits"].copy() if st.session_state["vm_edits"] is not None else None
-    edit_res  = st.session_state["res_edits"].copy() if st.session_state["res_edits"] is not None else None
-    edit_dep  = st.session_state["dep_edits"].copy() if st.session_state["dep_edits"] is not None else None
-
-    st.markdown(f"""
-    <div style="background:linear-gradient(135deg,{C['navy']} 0%,{C['deep_blue']} 100%);
-      border-radius:12px;padding:16px 24px;color:white;margin-bottom:18px;">
-      <div style="font-size:17px;font-weight:700;">Project Configuration</div>
-      <div style="font-size:12px;color:rgba(255,255,255,0.65);margin-top:2px;">
-        Edit project fields in-session. Changes are not written back to OneDrive until writeback is implemented.
+    <div style='background:#FFF8F0;border:1px solid {C['amber']};border-left:4px solid {C['amber']};
+      border-radius:8px;padding:14px 18px;margin:8px 0;'>
+      <div style='font-size:10px;font-weight:700;letter-spacing:.08em;text-transform:uppercase;
+        color:{C['amber']};margin-bottom:6px;'>CDM AS A CASE STUDY IN DELAY RISK</div>
+      <div style='font-size:12px;color:#1a1a1a;line-height:1.6;'>
+        <strong>P11 (CDM DAUT ID Replacement) is currently Delayed.</strong>
+        It is the upstream dependency for 8 other projects: P27 (SFDC Daily Sync), P20 (CPQ/Revenue Cloud),
+        P29 (SFDC DataCloud), P7 (Forecasting), P15 (MTM Expansion), P22 (Sales Planning),
+        P38 (SYSS/MAS), and P60 (AFAG).<br>
+        <span style='color:{C['red']};font-weight:600;'>
+        Every month CDM slips, it delays quoting, forecasting, pricing, and customer data integrity
+        across the commercial stack.</span>
       </div>
     </div>""", unsafe_allow_html=True)
 
-    st.markdown("<div class='edit-banner'>⚠️ All edits are session-only and will not persist across refreshes.</div>",
+    # ── Spotlight table ───────────────────────────────────────
+    st.markdown("<hr class='slim'>", unsafe_allow_html=True)
+    st.markdown("<div class='sec'>Project Spotlight — Top & Delayed</div>",
                 unsafe_allow_html=True)
+    st.caption("Ranked by delay status + impact score. Edit values directly in Excel.")
 
-    # ── Filters ──────────────────────────────────────────────
-    st.markdown("<div class='section-title'>Filters</div>", unsafe_allow_html=True)
-    cf1, cf2, cf3, cf4 = st.columns(4)
+    spot = revops_df.copy()
+    spot["__score"] = 0
+    if delay_c:
+        spot["__score"] += (spot[delay_c].str.strip().str.upper()=="Y").astype(int)*10
+    if impact_c:
+        spot["__score"] += pd.to_numeric(spot[impact_c], errors="coerce").fillna(0)
+    if bv_c:
+        spot["__score"] += pd.to_numeric(spot[bv_c], errors="coerce").fillna(0)/1000
+    spot = spot.sort_values("__score", ascending=False).head(20)
 
-    func_opts = ["All"]
-    if func_col and func_col in edit_proj.columns:
-        func_opts += sorted(edit_proj[func_col].dropna().unique().tolist())
-    elif team_col_p and team_col_p in edit_proj.columns:
-        func_opts += sorted(edit_proj[team_col_p].dropna().unique().tolist())
-    cf_func = cf1.selectbox("Function / Team", func_opts)
+    disp_cols = [c for c in [pid_c, name_c, band_c, status_c, type_c, CDM, bv_c, dar_c] if c]
+    disp = spot[disp_cols].rename(columns={CDM:"CDM Dep"})
+    if bv_c in disp.columns:  disp = disp.rename(columns={bv_c:"Biz Value ($)"})
+    if dar_c in disp.columns: disp = disp.rename(columns={dar_c:"$ at Risk"})
+    st.dataframe(disp.reset_index(drop=True), use_container_width=True, hide_index=True,
+                 height=340)
 
-    type_opts = ["All"]
-    if proj_type_col and proj_type_col in edit_proj.columns:
-        type_opts += sorted(edit_proj[proj_type_col].dropna().unique().tolist())
-    else:
-        type_opts += ["Strategic","Sustaining"]
-    cf_type = cf2.selectbox("Project Type", type_opts)
-
-    band_opts = ["All","Top","Middle","Lower","Unranked"]
-    cf_band = cf3.selectbox("Priority Band", band_opts)
-
-    cf_search = cf4.text_input("Search Project Name", placeholder="Type to filter…")
-
-    # apply config filters to edit_proj
-    cfg_df = edit_proj.copy()
-    if cf_func != "All":
-        tcol = func_col or team_col_p
-        if tcol and tcol in cfg_df.columns:
-            cfg_df = cfg_df[cfg_df[tcol]==cf_func]
-    if cf_type != "All" and proj_type_col and proj_type_col in cfg_df.columns:
-        cfg_df = cfg_df[cfg_df[proj_type_col]==cf_type]
-    if cf_band != "All":
-        cfg_df = cfg_df[cfg_df["__band__"]==cf_band]
-    if cf_search and proj_name_col and proj_name_col in cfg_df.columns:
-        cfg_df = cfg_df[cfg_df[proj_name_col].astype(str).str.lower()
-                        .str.contains(cf_search.lower(), na=False)]
-
-    st.markdown(f"<div style='font-size:11px;color:{C['gray']};margin-bottom:10px;'>"
-                f"<strong>{len(cfg_df)}</strong> projects shown</div>", unsafe_allow_html=True)
-
-    st.markdown("<hr class='section-divider'>", unsafe_allow_html=True)
-
-    # ── Main editable table ───────────────────────────────────
-    st.markdown("<div class='section-title'>Project Fields</div>", unsafe_allow_html=True)
-
-    editable_fields = []
-    display_rename  = {}
-
-    # always show id + name
-    if proj_id_col:   editable_fields.append(proj_id_col)
-    if proj_name_col: editable_fields.append(proj_name_col)
-
-    # conditionally add columns that exist
-    for col_var, label in [
-        (proj_type_col,     "Project Type"),
-        (status_col,        "Status"),
-        (priority_rank_col, "Priority Rank"),
-        ("__band__",        "Priority Band"),
-        (effort_col,        "Effort Score"),
-        (impact_col,        "Impact Score"),
-        (biz_val_col,       "Business Value ($)"),
-        (dar_proj_col,      "Dollars at Risk ($)"),
-        (owner_col,         "Owner"),
-    ]:
-        if col_var and col_var in cfg_df.columns:
-            editable_fields.append(col_var)
-            display_rename[col_var] = label
-
-    # deduplicate preserving order
-    seen = set(); deduped = []
-    for c in editable_fields:
-        if c not in seen: deduped.append(c); seen.add(c)
-    editable_fields = deduped
-
-    display_df = cfg_df[editable_fields].copy().rename(columns=display_rename)
-
-    # column config for st.data_editor
-    col_config = {}
-    if "Priority Rank" in display_df.columns:
-        col_config["Priority Rank"] = st.column_config.NumberColumn(
-            "Priority Rank", min_value=1, step=1, help="Rank for Strategic projects only")
-    if "Project Type" in display_df.columns:
-        col_config["Project Type"] = st.column_config.SelectboxColumn(
-            "Project Type", options=["Strategic","Sustaining","Unknown"])
-    if "Status" in display_df.columns:
-        all_s = sorted(proj_df[status_col].dropna().unique().tolist()) if status_col else []
-        col_config["Status"] = st.column_config.SelectboxColumn("Status", options=all_s or None)
-    if "Effort Score" in display_df.columns:
-        col_config["Effort Score"] = st.column_config.SelectboxColumn(
-            "Effort Score", options=["1","2","3","4","5","S","M","L"])
-    if "Impact Score" in display_df.columns:
-        col_config["Impact Score"] = st.column_config.NumberColumn(
-            "Impact Score", min_value=1, max_value=5, step=1)
-    if "Business Value ($)" in display_df.columns:
-        col_config["Business Value ($)"] = st.column_config.NumberColumn(
-            "Business Value ($)", min_value=0, format="$%d")
-    if "Dollars at Risk ($)" in display_df.columns:
-        col_config["Dollars at Risk ($)"] = st.column_config.NumberColumn(
-            "Dollars at Risk ($)", min_value=0, format="$%d")
-    if "Priority Band" in display_df.columns:
-        col_config["Priority Band"] = st.column_config.SelectboxColumn(
-            "Priority Band", options=["Top","Middle","Lower","Unranked"])
-
-    edited_main = st.data_editor(
-        display_df,
-        use_container_width=True,
-        hide_index=True,
-        num_rows="fixed",
-        column_config=col_config,
-        key="cfg_main_editor",
-    )
-
-    if st.button("💾  Apply Project Field Edits", key="apply_proj_edits"):
-        # Map renamed columns back to originals
-        rev_rename = {v:k for k,v in display_rename.items()}
-        edited_back = edited_main.rename(columns=rev_rename)
-        for col in edited_back.columns:
-            if col in edit_proj.columns:
-                edit_proj.loc[cfg_df.index, col] = edited_back[col].values
-        # Recompute band if rank changed
-        edit_proj["__band__"] = assign_priority_band(edit_proj, priority_rank_col)
-        st.session_state["proj_edits"] = edit_proj
-        st.success("✅ Project fields updated in session.")
-
-    st.markdown("<hr class='section-divider'>", unsafe_allow_html=True)
-
-    # ── Value Category mapping ────────────────────────────────
-    st.markdown("<div class='section-title'>Value Category Mapping</div>", unsafe_allow_html=True)
-
-    if edit_vm is None or vm_pid_col is None or vm_cat_col is None:
-        st.markdown("<div class='ph-note'>ℹ️ Project_Value_Map sheet not found or missing expected columns "
-                    "(Project ID, Value Category). Add this sheet to enable category editing.</div>",
-                    unsafe_allow_html=True)
-    else:
-        # Show project selector scoped to current config filter
-        vm_proj_ids = cfg_df[proj_id_col].dropna().unique().tolist() if proj_id_col else []
-        if not vm_proj_ids:
-            st.info("No projects visible under current filters.")
-        else:
-            vm_sel_pid = st.selectbox("Select Project to Edit Value Categories",
-                                      ["— select —"] + [str(p) for p in vm_proj_ids],
-                                      key="vm_proj_sel")
-            if vm_sel_pid and vm_sel_pid != "— select —":
-                cur_cats = edit_vm[edit_vm[vm_pid_col].astype(str)==vm_sel_pid][vm_cat_col].dropna().tolist()
-                all_cats = (sorted(val_dict_df[vd_cat_col].dropna().unique().tolist())
-                            if val_dict_df is not None and vd_cat_col else
-                            sorted(edit_vm[vm_cat_col].dropna().unique().tolist()))
-                new_cats = st.multiselect(f"Value Categories for project {vm_sel_pid}",
-                                          all_cats, default=cur_cats, key="vm_cats_sel")
-                if st.button("💾  Apply Category Changes", key="apply_vm"):
-                    # Remove old rows for this pid and insert new ones
-                    keep_mask = edit_vm[vm_pid_col].astype(str) != vm_sel_pid
-                    kept = edit_vm[keep_mask].copy()
-                    new_rows = pd.DataFrame({
-                        vm_pid_col: [vm_sel_pid]*len(new_cats),
-                        vm_cat_col: new_cats,
-                    })
-                    if vm_grp_col and val_dict_df is not None and vd_cat_col and vd_grp_col:
-                        grp_map = val_dict_df.set_index(vd_cat_col)[vd_grp_col].to_dict()
-                        new_rows[vm_grp_col] = new_rows[vm_cat_col].map(grp_map)
-                    edit_vm_new = pd.concat([kept, new_rows], ignore_index=True)
-                    st.session_state["vm_edits"] = edit_vm_new
-                    st.success(f"✅ Value categories updated for project {vm_sel_pid}.")
-
-    st.markdown("<hr class='section-divider'>", unsafe_allow_html=True)
-
-    # ── Resource / Function reassignment ─────────────────────
-    st.markdown("<div class='section-title'>Resource & Function Assignment</div>",
-                unsafe_allow_html=True)
-
-    if edit_res is None or pid_col_r is None:
-        st.markdown("<div class='ph-note'>ℹ️ Project_Resources sheet not found.</div>",
-                    unsafe_allow_html=True)
-    else:
-        vm_proj_ids_res = cfg_df[proj_id_col].dropna().unique().tolist() if proj_id_col else []
-        if vm_proj_ids_res:
-            res_sel_pid = st.selectbox("Select Project to Edit Resources",
-                                       ["— select —"] + [str(p) for p in vm_proj_ids_res],
-                                       key="res_proj_sel")
-            if res_sel_pid and res_sel_pid != "— select —":
-                res_rows = edit_res[edit_res[pid_col_r].astype(str)==res_sel_pid].copy()
-                all_res_cols = [c for c in edit_res.columns if c != pid_col_r]
-                res_col_cfg = {}
-                if team_col_r and team_col_r in edit_res.columns:
-                    all_teams = sorted(edit_res[team_col_r].dropna().unique().tolist())
-                    res_col_cfg[team_col_r] = st.column_config.SelectboxColumn(
-                        team_col_r, options=all_teams)
-                edited_res_rows = st.data_editor(
-                    res_rows[all_res_cols] if all_res_cols else res_rows,
-                    use_container_width=True,
-                    hide_index=True,
-                    num_rows="dynamic",
-                    column_config=res_col_cfg,
-                    key="res_editor",
-                )
-                if st.button("💾  Apply Resource Changes", key="apply_res"):
-                    keep_mask = edit_res[pid_col_r].astype(str) != res_sel_pid
-                    kept_r = edit_res[keep_mask].copy()
-                    edited_res_rows[pid_col_r] = res_sel_pid
-                    new_res = pd.concat([kept_r, edited_res_rows], ignore_index=True)
-                    st.session_state["res_edits"] = new_res
-                    st.success(f"✅ Resources updated for project {res_sel_pid}.")
-
-    st.markdown("<hr class='section-divider'>", unsafe_allow_html=True)
-
-    # ── Dependency reassignment ───────────────────────────────
-    st.markdown("<div class='section-title'>Dependency Management</div>", unsafe_allow_html=True)
-
-    if edit_dep is None:
-        st.markdown("<div class='ph-note'>ℹ️ Dependencies sheet not found.</div>",
-                    unsafe_allow_html=True)
-    else:
-        dep_pid_col2 = get_col(edit_dep,"Project ID","ProjectID","ID","Dependent Project ID")
-        vm_proj_ids_dep = cfg_df[proj_id_col].dropna().unique().tolist() if proj_id_col else []
-        if dep_pid_col2 and vm_proj_ids_dep:
-            dep_sel_pid = st.selectbox("Select Project to Edit Dependencies",
-                                       ["— select —"] + [str(p) for p in vm_proj_ids_dep],
-                                       key="dep_proj_sel")
-            if dep_sel_pid and dep_sel_pid != "— select —":
-                dep_rows = edit_dep[edit_dep[dep_pid_col2].astype(str)==dep_sel_pid].copy()
-                all_pids = sorted(edit_proj[proj_id_col].dropna().astype(str).unique().tolist()) if proj_id_col else []
-                dep_on_col = get_col(edit_dep,"Depends On","DependsOn","Dependency ID","dependency_id")
-                dep_col_cfg = {}
-                if dep_on_col and dep_on_col in edit_dep.columns:
-                    dep_col_cfg[dep_on_col] = st.column_config.SelectboxColumn(
-                        dep_on_col, options=all_pids,
-                        help="Select by Project ID — use Project ID, not free text")
-                edited_dep_rows = st.data_editor(
-                    dep_rows,
-                    use_container_width=True,
-                    hide_index=True,
-                    num_rows="dynamic",
-                    column_config=dep_col_cfg,
-                    key="dep_editor",
-                )
-                if st.button("💾  Apply Dependency Changes", key="apply_dep"):
-                    keep_mask = edit_dep[dep_pid_col2].astype(str) != dep_sel_pid
-                    kept_d = edit_dep[keep_mask].copy()
-                    edited_dep_rows[dep_pid_col2] = dep_sel_pid
-                    new_dep = pd.concat([kept_d, edited_dep_rows], ignore_index=True)
-                    st.session_state["dep_edits"] = new_dep
-                    st.success(f"✅ Dependencies updated for project {dep_sel_pid}.")
-        elif dep_pid_col2 is None:
-            st.warning("Dependencies sheet found but Project ID column is missing.")
-
+    # ── Edit CTA ──────────────────────────────────────────────
     st.markdown(f"""
-    <hr style='border:none;border-top:1px solid #E8ECF0;margin:32px 0 12px 0;'>
-    <div style='font-size:10px;color:{C["gray"]};text-align:center;padding-bottom:10px;'>
-      Project Configuration · Session edits only · Not persisted to OneDrive
+    <div class='edit-cta'>
+      ✏️ <strong>Want to update status, scores, or add Business Value / $ at Risk?</strong>
+      Open the source Excel file — the dashboard refreshes automatically twice daily.
+      &nbsp;&nbsp;<a href='{EDIT_LINK}' target='_blank'
+        style='color:{C['blue']};font-weight:700;'>Open Excel →</a>
     </div>""", unsafe_allow_html=True)
 
 
-# ══════════════════════════════════════════════════════════════
-#  EXECUTIVE DASHBOARD — Value + Resource + Dependency addons
-#  (appended inside _tab_exec_obj via a second context block)
-# ══════════════════════════════════════════════════════════════
-with _tab_exec_obj:
+# ═══════════════════════════════════════════════════════════════
+# ██  PORTFOLIO DETAIL  ██
+# ═══════════════════════════════════════════════════════════════
+elif view == "📊 Portfolio Detail":
 
-    # Use session-state edited data where available
-    _exec_proj = st.session_state["proj_edits"].copy()
-    _exec_vm   = st.session_state["vm_edits"].copy() if st.session_state["vm_edits"] is not None else None
-    _exec_res  = st.session_state["res_edits"].copy() if st.session_state["res_edits"] is not None else None
-    _exec_dep  = st.session_state["dep_edits"].copy() if st.session_state["dep_edits"] is not None else None
+    # ── Sidebar-style filters in a horizontal strip ────────────
+    st.markdown("<div class='sec'>Filters</div>", unsafe_allow_html=True)
+    f1,f2,f3,f4,f5 = st.columns(5)
 
-    # apply same sidebar filters to exec proj
-    _exec_filtered = filtered.copy()  # already filtered by sidebar
+    band_opts = ["All"] + sorted([b for b in revops_df[band_c].dropna().unique() if b] ) if band_c else ["All"]
+    status_opts = ["All"] + sorted([s for s in revops_df[status_c].dropna().unique() if s]) if status_c else ["All"]
+    type_opts_f = ["All"] + sorted([t for t in revops_df[type_c].dropna().unique() if t]) if type_c else ["All"]
+    cdm_opts_f  = ["All","Yes","No","Unknown"]
+    core_opts   = ["All"] + sorted([c for c in revops_df[core_c].dropna().unique() if c]) if core_c else ["All"]
 
-    st.markdown("<hr class='section-divider'>", unsafe_allow_html=True)
-    st.markdown("<div class='section-title'>Priority Bands</div>", unsafe_allow_html=True)
+    sel_band   = f1.selectbox("Priority Band",  band_opts,    key="pb")
+    sel_status = f2.selectbox("Status",         status_opts,  key="ps")
+    sel_type   = f3.selectbox("Project Type",   type_opts_f,  key="pt")
+    sel_cdm    = f4.selectbox("CDM Dependency", cdm_opts_f,   key="pc")
+    sel_core   = f5.selectbox("Requested By",   core_opts,    key="pr")
 
-    # Priority Band grouping
-    band_order = ["Top","Middle","Lower","Unranked"]
-    band_colors = {"Top":C["teal"],"Middle":C["bright_blue"],"Lower":C["gray"],"Unranked":"#D1D5DB"}
+    filt = revops_df.copy()
+    if sel_band   != "All" and band_c:   filt = filt[filt[band_c]==sel_band]
+    if sel_status != "All" and status_c: filt = filt[filt[status_c]==sel_status]
+    if sel_type   != "All" and type_c:   filt = filt[filt[type_c]==sel_type]
+    if sel_cdm    != "All":              filt = filt[filt[CDM]==sel_cdm]
+    if sel_core   != "All" and core_c:   filt = filt[filt[core_c]==sel_core]
 
-    if "__band__" in _exec_filtered.columns:
-        for band in band_order:
-            band_df = _exec_filtered[_exec_filtered["__band__"]==band]
-            if band_df.empty: continue
-            with st.expander(f"**{band} Priority** — {len(band_df)} projects", expanded=(band=="Top")):
-                band_cols = [c for c in [proj_id_col,proj_name_col,proj_type_col,owner_col,
-                                          status_col,biz_val_col,dar_proj_col,effort_col,impact_col]
-                             if c and c in band_df.columns]
-                bd = band_df[band_cols].rename(columns={
-                    biz_val_col:"Business Value ($)",dar_proj_col:"Dollars at Risk ($)"
-                } if biz_val_col or dar_proj_col else {})
-                st.dataframe(bd.reset_index(drop=True), use_container_width=True, hide_index=True)
+    st.caption(f"**{len(filt)}** of {total} RevOps projects shown")
+    st.markdown("<hr class='slim'>", unsafe_allow_html=True)
 
-    # Top 5 by Business Value
-    if biz_val_col and biz_val_col in _exec_filtered.columns:
-        st.markdown("<div class='section-title' style='margin-top:20px;'>Top 5 by Business Value</div>",
-                    unsafe_allow_html=True)
-        tv = _exec_filtered.copy()
-        tv[biz_val_col] = pd.to_numeric(tv[biz_val_col], errors="coerce")
-        top5 = tv.nlargest(5, biz_val_col)
-        t5_cols = [c for c in [proj_id_col,proj_name_col,owner_col,status_col,
-                                biz_val_col,"__band__"] if c and c in top5.columns]
-        st.dataframe(top5[t5_cols].rename(columns={biz_val_col:"Business Value ($)",
-                                                    "__band__":"Priority Band"})
-                     .reset_index(drop=True), use_container_width=True, hide_index=True)
+    # ── Two charts ────────────────────────────────────────────
+    ch1, ch2 = st.columns(2)
+    with ch1:
+        st.caption("**Status breakdown**")
+        if status_c and not filt.empty:
+            sc = filt[status_c].value_counts().reset_index()
+            sc.columns = ["Status","Count"]
+            fig = px.bar(sc.sort_values("Count",ascending=False),
+                         x="Status", y="Count", color="Status",
+                         color_discrete_map=STATUS_COLOR, template="plotly_white")
+            fig.update_layout(showlegend=False)
+            st.plotly_chart(chart_base(fig,220), use_container_width=True)
 
-    st.markdown("<hr class='section-divider'>", unsafe_allow_html=True)
+    with ch2:
+        st.caption("**Effort vs Impact**")
+        if effort_c and impact_c and not filt.empty:
+            sdf = filt[[c for c in [pid_c,name_c,effort_c,impact_c,status_c,CDM] if c]].copy()
+            sdf[effort_c] = pd.to_numeric(sdf[effort_c], errors="coerce")
+            sdf[impact_c] = pd.to_numeric(sdf[impact_c], errors="coerce")
+            sdf = sdf.dropna(subset=[effort_c,impact_c])
+            if not sdf.empty:
+                # deterministic jitter
+                def jit(s, sc=0.12):
+                    return s.apply(lambda v: ((int(hashlib.md5(str(v).encode()).hexdigest(),16)%1000)/1000-.5)*2*sc)
+                sdf["__x"] = sdf[effort_c] + jit(sdf[effort_c])
+                sdf["__y"] = sdf[impact_c] + jit(sdf[impact_c])
+                hov = {c:True for c in [name_c,pid_c] if c}
+                fig2 = px.scatter(sdf, x="__x", y="__y",
+                                  color=status_c if status_c else None,
+                                  color_discrete_map=STATUS_COLOR,
+                                  hover_data=hov, template="plotly_white", opacity=0.8)
+                fig2.update_traces(marker=dict(size=11,line=dict(width=1.5,color="white")))
+                fig2.update_layout(xaxis_title="Effort",yaxis_title="Impact", showlegend=True,
+                                   legend=dict(orientation="h",y=1.12,font=dict(size=10)))
+                st.plotly_chart(chart_base(fig2,220), use_container_width=True)
 
-    # Value Breakdown from Project_Value_Map
-    st.markdown("<div class='section-title'>Value Breakdown</div>", unsafe_allow_html=True)
+    # ── Resource load chart ───────────────────────────────────
+    if res_df is not None and res_pid_c and res_team_c and pid_c:
+        st.caption("**Resource / Team Load (filtered projects)**")
+        filt_pids = set(filt[pid_c].dropna().astype(str).unique())
+        res_f = res_df[res_df[res_pid_c].astype(str).isin(filt_pids)]
+        if not res_f.empty:
+            tc = res_f.groupby(res_team_c)[res_pid_c].nunique().reset_index()
+            tc.columns = ["Team","Projects"]
+            tc = tc.sort_values("Projects", ascending=True)
+            avg = tc["Projects"].mean()
+            tc["Color"] = tc["Projects"].apply(
+                lambda x: C["red"] if x>avg*1.4 else (C["amber"] if x>avg else C["teal"]))
+            fig3 = go.Figure(go.Bar(
+                x=tc["Projects"], y=tc["Team"], orientation="h",
+                marker_color=tc["Color"].tolist()))
+            fig3.update_layout(showlegend=False)
+            st.plotly_chart(chart_base(fig3, max(220, len(tc)*28)), use_container_width=True)
+            st.caption("🔴 Overloaded  🟠 Elevated  🟢 Normal  (relative to average)")
 
-    if _exec_vm is not None and vm_pid_col and vm_cat_col:
-        # join to filtered project ids
-        if proj_id_col:
-            valid_pids = _exec_filtered[proj_id_col].dropna().unique()
-            vm_f = _exec_vm[_exec_vm[vm_pid_col].isin(valid_pids)]
-        else:
-            vm_f = _exec_vm.copy()
+    st.markdown("<hr class='slim'>", unsafe_allow_html=True)
 
-        val_left, val_right = st.columns(2)
+    # ── Value Groups ──────────────────────────────────────────
+    st.markdown("<div class='sec'>Value Groups</div>", unsafe_allow_html=True)
 
-        with val_left:
-            st.markdown(f"<div style='font-size:11px;font-weight:700;color:{C['gray']};letter-spacing:0.06em;"
-                        f"text-transform:uppercase;margin-bottom:8px;'>Projects by Value Category</div>",
-                        unsafe_allow_html=True)
-            cat_counts = vm_f.groupby(vm_cat_col)[vm_pid_col].nunique().reset_index()
-            cat_counts.columns = ["Value Category","Projects"]
-            cat_counts = cat_counts.sort_values("Projects",ascending=True)
-            fig_vc = px.bar(cat_counts, x="Projects", y="Value Category", orientation="h",
-                            color="Projects",
-                            color_continuous_scale=[[0,C["light_blue"]],[1,C["teal"]]],
-                            template="plotly_white")
-            fig_vc = chart_layout(fig_vc, height=max(260, len(cat_counts)*28))
-            fig_vc.update_layout(coloraxis_showscale=False)
-            st.plotly_chart(fig_vc, use_container_width=True)
-
-        with val_right:
-            if vm_grp_col and vm_grp_col in vm_f.columns:
-                st.markdown(f"<div style='font-size:11px;font-weight:700;color:{C['gray']};letter-spacing:0.06em;"
-                            f"text-transform:uppercase;margin-bottom:8px;'>Projects by Value Group</div>",
-                            unsafe_allow_html=True)
-                grp_counts = vm_f.groupby(vm_grp_col)[vm_pid_col].nunique().reset_index()
-                grp_counts.columns = ["Value Group","Projects"]
-                fig_vg = px.pie(grp_counts, names="Value Group", values="Projects",
-                                color_discrete_sequence=PALETTE, hole=0.50, template="plotly_white")
-                fig_vg.update_traces(textposition="outside", textfont_size=10,
-                                     marker=dict(line=dict(color="white",width=2)))
-                fig_vg.update_layout(height=280, margin=dict(t=8,b=8,l=8,r=8),
-                                     showlegend=True, legend=dict(font=dict(size=10)),
-                                     paper_bgcolor="white", font=dict(family="Inter, sans-serif"))
-                st.plotly_chart(fig_vg, use_container_width=True)
-
-            # Value Category Dictionary reference
-            if val_dict_df is not None and vd_cat_col:
-                st.markdown(f"<div style='font-size:11px;font-weight:700;color:{C['gray']};letter-spacing:0.06em;"
-                            f"text-transform:uppercase;margin-bottom:6px;margin-top:12px;'>Category Dictionary</div>",
-                            unsafe_allow_html=True)
-                st.dataframe(val_dict_df.head(20), use_container_width=True, hide_index=True, height=180)
-    else:
-        st.markdown("<div class='ph-note'>ℹ️ Project_Value_Map sheet not available. "
-                    "Add it to enable value breakdown analysis.</div>", unsafe_allow_html=True)
-
-    st.markdown("<hr class='section-divider'>", unsafe_allow_html=True)
-
-    # Resource Allocation
-    st.markdown("<div class='section-title'>Resource Allocation</div>", unsafe_allow_html=True)
-
-    if _exec_res is not None and team_col_r and pid_col_r:
-        ra_left, ra_right = st.columns(2)
-        valid_pids_r = _exec_filtered[proj_id_col].dropna().unique() if proj_id_col else []
-        res_f = _exec_res[_exec_res[pid_col_r].isin(valid_pids_r)] if len(valid_pids_r) else _exec_res
-        func_counts = res_f.groupby(team_col_r)[pid_col_r].nunique().reset_index()
-        func_counts.columns = ["Function","Projects"]
-        func_counts = func_counts.sort_values("Projects",ascending=False)
-        with ra_left:
-            st.markdown(f"<div style='font-size:11px;font-weight:700;color:{C['gray']};letter-spacing:0.06em;"
-                        f"text-transform:uppercase;margin-bottom:8px;'>Projects by Function</div>",
-                        unsafe_allow_html=True)
-            fig_ra = px.bar(func_counts.sort_values("Projects",ascending=True),
-                            x="Projects",y="Function",orientation="h",
-                            color="Projects",
-                            color_continuous_scale=[[0,C["light_blue"]],[1,C["deep_blue"]]],
-                            template="plotly_white")
-            fig_ra = chart_layout(fig_ra, height=max(220, len(func_counts)*30))
-            fig_ra.update_layout(coloraxis_showscale=False)
-            st.plotly_chart(fig_ra, use_container_width=True)
-        with ra_right:
-            st.markdown(f"<div style='font-size:11px;font-weight:700;color:{C['gray']};letter-spacing:0.06em;"
-                        f"text-transform:uppercase;margin-bottom:8px;'>Function Load Table</div>",
-                        unsafe_allow_html=True)
-            avg_load = res_f.groupby(team_col_r)[pid_col_r].nunique().mean()
-            func_counts["Load Status"] = func_counts["Projects"].apply(
-                lambda x: "⚠️ Overloaded" if x > avg_load*1.3 else
-                          ("✅ Normal" if x <= avg_load else "🔶 Elevated"))
-            st.dataframe(func_counts, use_container_width=True, hide_index=True, height=260)
-    else:
-        st.markdown("<div class='ph-note'>ℹ️ Resource data unavailable.</div>",
-                    unsafe_allow_html=True)
-
-    st.markdown("<hr class='section-divider'>", unsafe_allow_html=True)
-
-    # Dependency Risk
-    st.markdown("<div class='section-title'>Dependency Risk</div>", unsafe_allow_html=True)
-
-    if _exec_dep is not None:
-        dep_pid_col_e = get_col(_exec_dep,"Project ID","ProjectID","ID","Dependent Project ID")
-        dep_on_col_e  = get_col(_exec_dep,"Depends On","DependsOn","Dependency ID","dependency_id")
-        if dep_pid_col_e:
-            valid_pids_d  = _exec_filtered[proj_id_col].dropna().unique() if proj_id_col else []
-            dep_f = _exec_dep[_exec_dep[dep_pid_col_e].isin(valid_pids_d)]
-            dep_l, dep_r = st.columns(2)
-            with dep_l:
-                dep_count = dep_f.groupby(dep_pid_col_e).size().reset_index()
-                dep_count.columns = ["Project ID","Dependency Count"]
-                dep_count = dep_count.sort_values("Dependency Count",ascending=False)
-                st.markdown(f"<div style='font-size:11px;font-weight:700;color:{C['gray']};letter-spacing:0.06em;"
-                            f"text-transform:uppercase;margin-bottom:8px;'>Projects by Dependency Count</div>",
-                            unsafe_allow_html=True)
-                fig_dep = px.bar(dep_count.head(15).sort_values("Dependency Count",ascending=True),
-                                 x="Dependency Count", y="Project ID", orientation="h",
-                                 color="Dependency Count",
-                                 color_continuous_scale=[[0,"#FEF3C7"],[0.5,"#E67E22"],[1,"#C0392B"]],
-                                 template="plotly_white")
-                fig_dep = chart_layout(fig_dep, height=260)
-                fig_dep.update_layout(coloraxis_showscale=False)
-                st.plotly_chart(fig_dep, use_container_width=True)
-            with dep_r:
-                # highlight bottlenecks: projects that are depended on by many others
-                if dep_on_col_e and dep_on_col_e in dep_f.columns:
-                    blocking = dep_f.groupby(dep_on_col_e).size().reset_index()
-                    blocking.columns = ["Blocking Project ID","Blocked By N Projects"]
-                    blocking = blocking.sort_values("Blocked By N Projects",ascending=False).head(10)
-                    st.markdown(f"<div style='font-size:11px;font-weight:700;color:{C['gray']};letter-spacing:0.06em;"
-                                f"text-transform:uppercase;margin-bottom:8px;'>Bottleneck Projects</div>",
-                                unsafe_allow_html=True)
-                    st.dataframe(blocking, use_container_width=True, hide_index=True, height=240)
-                else:
-                    st.dataframe(dep_count, use_container_width=True, hide_index=True, height=240)
-        else:
-            st.info("Dependencies sheet found but Project ID column missing.")
-    else:
-        st.markdown("<div class='ph-note'>ℹ️ Dependencies sheet not available.</div>",
-                    unsafe_allow_html=True)
-
-    st.markdown("<hr class='section-divider'>", unsafe_allow_html=True)
-
-    # AI Insights (rule-based)
-    st.markdown("<div class='section-title'>AI Insights</div>", unsafe_allow_html=True)
-    st.markdown("<div style='font-size:11px;color:#6B7280;margin-bottom:12px;'>"
-                "Rule-based insights derived from current portfolio data. "
-                "No ML model — logic driven by thresholds and rankings.</div>",
-                unsafe_allow_html=True)
-
-    ins_left, ins_right = st.columns(2)
-
-    with ins_left:
-        # 1. Top 3 value-driving categories
-        if _exec_vm is not None and vm_pid_col and vm_cat_col and proj_id_col:
-            valid_pids_ai = _exec_filtered[proj_id_col].dropna().unique()
-            vm_ai = _exec_vm[_exec_vm[vm_pid_col].isin(valid_pids_ai)]
-            top_cats = (vm_ai.groupby(vm_cat_col)[vm_pid_col].nunique()
-                        .sort_values(ascending=False).head(3))
-            if not top_cats.empty:
-                top_cat_lines = "; ".join([f"<strong>{c}</strong> ({n} projects)"
-                                           for c,n in top_cats.items()])
-                st.markdown(f"""
-                <div class="insight-box">
-                  <div style="font-size:11px;font-weight:700;color:{C['gray']};letter-spacing:0.06em;
-                    text-transform:uppercase;margin-bottom:6px;">Top Value-Driving Categories</div>
-                  <div style="font-size:13px;color:#374151;">{top_cat_lines}</div>
+    if vm_df is not None:
+        vm_pid_c  = nc(vm_df,"Project ID","ProjectID","ID")
+        vm_cat_c  = nc(vm_df,"Value Category","Category")
+        vm_grp_c  = nc(vm_df,"Value Group","Group")
+        if vm_pid_c and vm_grp_c:
+            filt_pids = set(filt[pid_c].dropna().astype(str).unique()) if pid_c else set()
+            vm_f = vm_df[vm_df[vm_pid_c].isin(filt_pids)] if filt_pids else vm_df
+            grp_counts = vm_f.groupby(vm_grp_c)[vm_pid_c].nunique().reset_index()
+            grp_counts.columns = ["Value Group","Projects"]
+            vg_cols = st.columns(len(grp_counts))
+            grp_colors = [C["teal"],C["blue"],C["lblue"],C["navy"],C["green"],C["amber"],C["gray"]]
+            for i,(col,(_, row)) in enumerate(zip(vg_cols, grp_counts.iterrows())):
+                clr = grp_colors[i % len(grp_colors)]
+                col.markdown(f"""
+                <div style='background:{C['white']};border-radius:8px;padding:12px 14px;
+                  border:1px solid #E2E8F2;border-top:3px solid {clr};text-align:center;'>
+                  <div style='font-size:22px;font-weight:700;color:{clr};'>{int(row['Projects'])}</div>
+                  <div style='font-size:10px;font-weight:600;color:{C['navy']};margin-top:3px;'>
+                    {row['Value Group']}</div>
                 </div>""", unsafe_allow_html=True)
 
-        # 2. Overloaded functions
-        if _exec_res is not None and team_col_r and pid_col_r and proj_id_col:
-            valid_pids_ai2 = _exec_filtered[proj_id_col].dropna().unique()
-            res_ai = _exec_res[_exec_res[pid_col_r].isin(valid_pids_ai2)]
-            if not res_ai.empty:
-                func_ai = res_ai.groupby(team_col_r)[pid_col_r].nunique()
-                mean_load = func_ai.mean()
-                overloaded = func_ai[func_ai > mean_load * 1.3].sort_values(ascending=False)
-                if not overloaded.empty:
-                    ol_lines = "; ".join([f"<strong>{f}</strong> ({n} projects)"
-                                          for f,n in overloaded.head(3).items()])
-                    st.markdown(f"""
-                    <div class="insight-box">
-                      <div style="font-size:11px;font-weight:700;color:{C['gray']};letter-spacing:0.06em;
-                        text-transform:uppercase;margin-bottom:6px;">Overloaded Functions</div>
-                      <div style="font-size:13px;color:#374151;">{ol_lines}</div>
-                    </div>""", unsafe_allow_html=True)
+    st.markdown("<hr class='slim'>", unsafe_allow_html=True)
 
-    with ins_right:
-        # 3. High-value projects not in Top Band
-        if biz_val_col and biz_val_col in _exec_filtered.columns and "__band__" in _exec_filtered.columns:
-            bv_vals = pd.to_numeric(_exec_filtered[biz_val_col], errors="coerce")
-            if bv_vals.notna().any():
-                bv_thresh = bv_vals.quantile(0.75) if bv_vals.notna().sum()>3 else bv_vals.max()
-                hi_val_not_top = _exec_filtered[
-                    (bv_vals >= bv_thresh) & (_exec_filtered["__band__"] != "Top")]
-                if not hi_val_not_top.empty:
-                    n_hv = len(hi_val_not_top)
-                    names = ", ".join(hi_val_not_top[proj_name_col].head(3).tolist()) if proj_name_col else f"{n_hv} projects"
-                    st.markdown(f"""
-                    <div class="insight-box" style="border-left:3px solid #E67E22;">
-                      <div style="font-size:11px;font-weight:700;color:{C['gray']};letter-spacing:0.06em;
-                        text-transform:uppercase;margin-bottom:6px;">High-Value Not in Top Band</div>
-                      <div style="font-size:13px;color:#374151;">
-                        <strong>{n_hv}</strong> high-value project{'s' if n_hv!=1 else ''} ranked outside Top:
-                        {names}{'…' if n_hv>3 else ''}.
-                        Consider re-evaluating priority bands.
-                      </div>
-                    </div>""", unsafe_allow_html=True)
+    # ── Full project table ────────────────────────────────────
+    st.markdown("<div class='sec'>All Projects</div>", unsafe_allow_html=True)
 
-        # 4. Dependencies but low priority
-        if _exec_dep is not None and proj_id_col and "__band__" in _exec_filtered.columns:
-            dep_pid_col_ins = get_col(_exec_dep,"Project ID","ProjectID","ID","Dependent Project ID")
-            if dep_pid_col_ins:
-                dep_pids = set(_exec_dep[dep_pid_col_ins].dropna().astype(str).unique())
-                low_pri_dep = _exec_filtered[
-                    (_exec_filtered[proj_id_col].astype(str).isin(dep_pids)) &
-                    (_exec_filtered["__band__"].isin(["Lower","Unranked"]))]
-                if not low_pri_dep.empty:
-                    n_ld = len(low_pri_dep)
-                    st.markdown(f"""
-                    <div class="insight-box" style="border-left:3px solid #C0392B;">
-                      <div style="font-size:11px;font-weight:700;color:{C['gray']};letter-spacing:0.06em;
-                        text-transform:uppercase;margin-bottom:6px;">Low-Priority Projects with Dependencies</div>
-                      <div style="font-size:13px;color:#374151;">
-                        <strong>{n_ld}</strong> project{'s' if n_ld!=1 else ''} {'have' if n_ld!=1 else 'has'}
-                        dependencies but sit in Lower or Unranked bands.
-                        These may create downstream bottlenecks.
-                      </div>
-                    </div>""", unsafe_allow_html=True)
+    show_cols = [c for c in [pid_c,name_c,band_c,type_c,status_c,core_c,CDM,
+                              effort_c,impact_c,bv_c,dar_c] if c]
+    disp2 = filt[show_cols].rename(columns={CDM:"CDM Dep"})
+    if bv_c  in disp2.columns: disp2 = disp2.rename(columns={bv_c:"Biz Value ($)"})
+    if dar_c in disp2.columns: disp2 = disp2.rename(columns={dar_c:"$ at Risk"})
+    st.dataframe(disp2.reset_index(drop=True), use_container_width=True,
+                 hide_index=True, height=420)
 
     st.markdown(f"""
-    <hr style='border:none;border-top:1px solid #E8ECF0;margin:32px 0 12px 0;'>
-    <div style='font-size:10px;color:{C["gray"]};text-align:center;padding-bottom:10px;'>
-      RevOps Program Dashboard · Executive Dashboard · Source: SharePoint · Refreshes every 60 s
+    <div class='edit-cta'>
+      ✏️ <strong>To update any field</strong> — Status, Priority Band, CDM flag, Business Value,
+      Dollars at Risk — open the Excel file. Dashboard refreshes every 12 hours automatically.
+      &nbsp;&nbsp;<a href='{EDIT_LINK}' target='_blank'
+        style='color:{C['blue']};font-weight:700;'>Open Excel →</a>
     </div>""", unsafe_allow_html=True)
+
+
+# ═══════════════════════════════════════════════════════════════
+# ██  PROJECT EXPLORER  ██
+# ═══════════════════════════════════════════════════════════════
+else:
+    st.markdown("<div class='sec'>Project Explorer</div>", unsafe_allow_html=True)
+
+    # ── Search + filter ───────────────────────────────────────
+    sc1, sc2, sc3 = st.columns([3,2,2])
+    search = sc1.text_input("Search project name or ID", placeholder="Type to filter…", key="search")
+    band_f = sc2.selectbox("Band", ["All"]+sorted([b for b in revops_df[band_c].dropna().unique() if b])) if band_c else "All"
+    stat_f = sc3.selectbox("Status", ["All"]+sorted([s for s in revops_df[status_c].dropna().unique() if s])) if status_c else "All"
+
+    exp_df = revops_df.copy()
+    if search and pid_c and name_c:
+        q = search.lower()
+        exp_df = exp_df[
+            exp_df[pid_c].astype(str).str.lower().str.contains(q, na=False) |
+            exp_df[name_c].astype(str).str.lower().str.contains(q, na=False)
+        ]
+    if band_f != "All" and band_c:   exp_df = exp_df[exp_df[band_c]==band_f]
+    if stat_f != "All" and status_c: exp_df = exp_df[exp_df[status_c]==stat_f]
+
+    # Sort: Top first, then delayed
+    if band_c:
+        band_order = {"Top Priority":0,"Middle Priority":1,"Lower Priority":2,"N/A":3}
+        exp_df = exp_df.copy()
+        exp_df["__bs"] = exp_df[band_c].map(band_order).fillna(4)
+        exp_df["__ds"] = (exp_df[delay_c].str.upper()=="Y").astype(int) * -1 if delay_c else 0
+        exp_df = exp_df.sort_values(["__bs","__ds"])
+
+    st.caption(f"**{len(exp_df)}** projects · click any row to see full details")
+
+    left_col, right_col = st.columns([2,3])
+
+    with left_col:
+        if exp_df.empty:
+            st.info("No projects match your filters.")
+        else:
+            sel_pid = None
+            for _, row in exp_df.iterrows():
+                pid  = str(row[pid_c]) if pid_c else "—"
+                name = str(row[name_c]) if name_c else "—"
+                band = str(row[band_c]) if band_c else ""
+                stat = str(row[status_c]) if status_c else ""
+                cdm  = row[CDM]
+                is_delayed = str(row[delay_c]).strip().upper()=="Y" if delay_c else False
+                card_class = "prow delayed" if is_delayed else "prow"
+                bdg        = status_badge(stat)
+                cdm_bdg    = cdm_badge(cdm)
+                bc         = BAND_COLOR.get(band, C["gray"])
+                desc       = str(row[rawval_c])[:80]+"…" if rawval_c and pd.notna(row[rawval_c]) and str(row[rawval_c]) != "None" else ""
+
+                btn_key = f"proj_{pid}"
+                clicked = st.button(
+                    f"[{pid}]  {name[:42]}{'…' if len(name)>42 else ''}",
+                    key=btn_key, use_container_width=True)
+                if clicked:
+                    st.session_state["selected_pid"] = pid
+                # mini metadata under button
+                st.markdown(
+                    f"<div style='font-size:10px;color:{C['gray']};margin:-6px 0 6px 6px;'>"
+                    f"<span style='color:{bc};font-weight:600;'>{band.replace(' Priority','')}</span>"
+                    f"  ·  {bdg}  ·  {cdm_bdg}</div>",
+                    unsafe_allow_html=True)
+
+    # ── Right: detail panel ───────────────────────────────────
+    with right_col:
+        sel = st.session_state.get("selected_pid")
+        if not sel and not exp_df.empty and pid_c:
+            sel = str(exp_df.iloc[0][pid_c])
+            st.session_state["selected_pid"] = sel
+
+        if sel and pid_c:
+            match = revops_df[revops_df[pid_c].astype(str)==sel]
+            if match.empty:
+                st.info("Select a project from the list.")
+            else:
+                row = match.iloc[0]
+                pname   = str(row[name_c]) if name_c else sel
+                pstatus = str(row[status_c]) if status_c else "—"
+                pband   = str(row[band_c])   if band_c  else "—"
+                ptype   = str(row[type_c])   if type_c  else "—"
+                is_del  = str(row[delay_c]).strip().upper()=="Y" if delay_c else False
+                pcdm    = row[CDM]
+                accent  = C["red"] if is_del else (C["amber"] if pcdm=="Yes" else C["blue"])
+
+                st.markdown(f"""
+                <div class='detail-hdr' style='background:linear-gradient(135deg,{C['navy']} 0%,{accent} 100%);'>
+                  <div style='font-size:11px;font-family:DM Mono;color:rgba(255,255,255,0.6);'>{sel}</div>
+                  <div style='font-size:17px;font-weight:700;color:white;margin:4px 0;'>{pname}</div>
+                  <div style='display:flex;gap:8px;flex-wrap:wrap;margin-top:6px;'>
+                    {status_badge(pstatus,11)}
+                    <span class='badge' style='background:rgba(255,255,255,0.15);color:white;font-size:10px;'>{pband}</span>
+                    <span class='badge' style='background:rgba(255,255,255,0.15);color:white;font-size:10px;'>{ptype}</span>
+                    {'<span class="badge" style="background:#FEF3C7;color:#D97706;font-size:10px;">⚠ CDM Dependent</span>' if pcdm=="Yes" else ''}
+                    {'<span class="badge" style="background:#FEE2E2;color:#C0392B;font-size:10px;">⚠ Delayed</span>' if is_del else ''}
+                  </div>
+                </div>""", unsafe_allow_html=True)
+
+                tab1, tab2, tab3, tab4 = st.tabs(["Overview","Resources","Dependencies","Risk & Value"])
+
+                with tab1:
+                    def dfield(label, col_key, fallback="Not yet captured"):
+                        val = str(row[col_key]) if col_key and col_key in row.index and pd.notna(row[col_key]) and str(row[col_key]) not in ("None","nan","") else None
+                        ph  = " ph" if not val else ""
+                        return f"""
+                        <div class='detail-field'>
+                          <div class='detail-lbl'>{label}</div>
+                          <div class='detail-val{ph}'>{val or fallback}</div>
+                        </div>"""
+
+                    c1, c2 = st.columns(2)
+                    with c1:
+                        st.markdown(
+                            dfield("Business Program", bizprog_c) +
+                            dfield("Core Team / Requested By", core_c) +
+                            dfield("Strategic Priority", strat_c) +
+                            dfield("Cycle", cycle_c) +
+                            dfield("Investment", invest_c),
+                            unsafe_allow_html=True)
+                    with c2:
+                        st.markdown(
+                            dfield("Priority Rank", rank_c) +
+                            dfield("Effort Score", effort_c) +
+                            dfield("Impact Score", impact_c) +
+                            dfield("If Delayed Impact", deli_c) +
+                            dfield("Value Groups", valgrp_c),
+                            unsafe_allow_html=True)
+
+                    raw = str(row[rawval_c]) if rawval_c and pd.notna(row[rawval_c]) and str(row[rawval_c]) not in ("None","nan","") else None
+                    if raw:
+                        st.markdown(f"""
+                        <div style='background:#F8FAFC;border-radius:6px;padding:10px 14px;
+                          border-left:3px solid {C['blue']};margin-top:4px;'>
+                          <div class='detail-lbl'>What This Project Delivers</div>
+                          <div style='font-size:12px;color:#374151;margin-top:3px;line-height:1.5;'>{raw}</div>
+                        </div>""", unsafe_allow_html=True)
+
+                with tab2:
+                    teams = proj_teams.get(sel, [])
+                    if teams:
+                        st.markdown(f"**{len(teams)} teams involved:**")
+                        for t in sorted(teams):
+                            st.markdown(f"- {t}")
+                    else:
+                        st.info("No resource data for this project.")
+
+                with tab3:
+                    deps = proj_deps.get(sel, [])
+                    if deps:
+                        st.markdown(f"**Depends on {len(deps)} project(s):**")
+                        for d in deps:
+                            dm = revops_df[revops_df[pid_c].astype(str)==d.strip()] if pid_c else pd.DataFrame()
+                            if not dm.empty:
+                                dn = str(dm.iloc[0][name_c]) if name_c else d
+                                ds = str(dm.iloc[0][status_c]) if status_c else "—"
+                                st.markdown(
+                                    f"- **{d}** — {dn} &nbsp; {status_badge(ds)}",
+                                    unsafe_allow_html=True)
+                            else:
+                                st.markdown(f"- {d}")
+                    else:
+                        st.info("No dependencies recorded for this project.")
+
+                    # Projects that depend ON this one
+                    blocking = [p for p,dlist in proj_deps.items() if sel in dlist]
+                    if blocking:
+                        st.markdown(f"**{len(blocking)} project(s) depend on this:**")
+                        for b in blocking:
+                            bm = revops_df[revops_df[pid_c].astype(str)==b] if pid_c else pd.DataFrame()
+                            bn = str(bm.iloc[0][name_c]) if not bm.empty and name_c else b
+                            st.markdown(f"- **{b}** — {bn}")
+
+                with tab4:
+                    r1, r2 = st.columns(2)
+                    with r1:
+                        def score_card(label, col_key, color):
+                            v = pd.to_numeric(row[col_key], errors="coerce") if col_key else None
+                            disp = str(int(v)) if v and not pd.isna(v) else "—"
+                            clr  = color if v and not pd.isna(v) else C["gray"]
+                            st.markdown(f"""
+                            <div style='background:{C['white']};border-radius:8px;padding:14px;
+                              border:1px solid #E2E8F2;margin-bottom:8px;'>
+                              <div class='detail-lbl'>{label}</div>
+                              <div style='font-size:28px;font-weight:700;color:{clr};'>{disp}</div>
+                            </div>""", unsafe_allow_html=True)
+                        score_card("Effort Score (1–5)", effort_c, C["blue"])
+                        score_card("Impact Score (1–5)", impact_c, C["teal"])
+
+                    with r2:
+                        def money_card(label, col_key, color):
+                            v = row[col_key] if col_key else None
+                            disp = fmt_val(v) if v and pd.notna(v) and str(v) not in ("None","nan","") else "Not yet captured"
+                            ph   = not (v and pd.notna(v) and str(v) not in ("None","nan",""))
+                            clr  = color if not ph else C["gray"]
+                            st.markdown(f"""
+                            <div style='background:{C['white']};border-radius:8px;padding:14px;
+                              border:1px solid #E2E8F2;margin-bottom:8px;'>
+                              <div class='detail-lbl'>{label}</div>
+                              <div style='font-size:20px;font-weight:700;color:{clr};
+                                {'font-style:italic;font-size:14px;' if ph else ''}'>{disp}</div>
+                            </div>""", unsafe_allow_html=True)
+                        money_card("Business Value ($)",   bv_c,  C["teal"])
+                        money_card("Dollars at Risk ($)",  dar_c, C["red"])
+
+                    # Delay / CDM risk flags
+                    if is_del:
+                        st.markdown(f"""
+                        <div style='background:#FEF3F2;border-left:3px solid {C['red']};
+                          border-radius:0 6px 6px 0;padding:10px 14px;font-size:12px;'>
+                          <strong style='color:{C['red']};'>⚠ Delay Flag Active</strong><br>
+                          <span style='color:#374151;'>Review owner accountability and blockers.
+                          {'This project is CDM-dependent — resolution requires P11 delivery.' if pcdm=='Yes' else ''}</span>
+                        </div>""", unsafe_allow_html=True)
+                    elif pcdm == "Yes":
+                        st.markdown(f"""
+                        <div style='background:#FFF8F0;border-left:3px solid {C['amber']};
+                          border-radius:0 6px 6px 0;padding:10px 14px;font-size:12px;'>
+                          <strong style='color:{C['amber']};'>CDM Dependency</strong><br>
+                          <span style='color:#374151;'>On track now but cannot advance past current stage
+                          until P11 (CDM DAUT ID Replacement) is delivered.</span>
+                        </div>""", unsafe_allow_html=True)
+                    else:
+                        st.markdown(f"""
+                        <div style='background:#F0FFF8;border-left:3px solid {C['teal']};
+                          border-radius:0 6px 6px 0;padding:10px 14px;font-size:12px;'>
+                          <strong style='color:{C['teal']};'>✓ No Active Risk Flags</strong>
+                        </div>""", unsafe_allow_html=True)
+
+                st.markdown(f"""
+                <div class='edit-cta' style='margin-top:12px;'>
+                  To update <strong>{pname}</strong> — change status, scores, CDM flag, or add
+                  business value — edit directly in Excel.
+                  &nbsp;<a href='{EDIT_LINK}' target='_blank'
+                    style='color:{C['blue']};font-weight:700;'>Open Excel →</a>
+                </div>""", unsafe_allow_html=True)
+
+# ── FOOTER ────────────────────────────────────────────────────
+st.markdown(f"""
+<hr class='slim'>
+<div style='display:flex;justify-content:space-between;align-items:center;
+  font-size:10px;color:{C['gray']};padding-bottom:8px;'>
+  <span>RevOps Program Dashboard · FY26 · Emerson · Read-only live view</span>
+  <span>Auto-refreshes every 12 hours ·
+    <a href='{EDIT_LINK}' target='_blank'
+      style='color:{C['blue']};text-decoration:none;font-weight:600;'>
+      Edit source in Excel →</a></span>
+</div>""", unsafe_allow_html=True)
